@@ -161,6 +161,38 @@ final class RateTests extends FunSuite {
     assertEquals(Ordering[RateReduction].compare(x = half, y = RateReduction.One), half.compare(RateReduction.One))
   }
 
+  test("multiplyBy rounds growth up and saturates at Max") {
+    val fivePerSecond = 5.per(1.second)
+
+    assertEquals(fivePerSecond.multiplyBy(factor = RateMultiplier.One), fivePerSecond)
+    assertEquals(fivePerSecond.multiplyBy(factor = RateMultiplier(value = 2.0)), 10.per(1.second))
+    assertEquals(Rate(perDay = 3L).multiplyBy(factor = RateMultiplier(value = 1.5)), Rate(perDay = 5L))
+    assertEquals(3.per(1.second).multiplyBy(factor = RateMultiplier(value = 1.5)), 9.per(2.seconds))
+    assertEquals(Rate.Min.multiplyBy(factor = RateMultiplier.Max), Rate.Max)
+    assertEquals(Rate.Max.multiplyBy(factor = RateMultiplier(value = 2.0)), Rate.Max)
+    assertEquals(Rate.Max.multiplyBy(factor = RateMultiplier.Max), Rate.Max)
+  }
+
+  test("RateMultiplier rejects values outside the useful rate range") {
+    assert(RateMultiplier.from(value = 0.0).isLeft)
+    assert(RateMultiplier.from(value = 0.999).isLeft)
+    assert(RateMultiplier.from(value = Rate.Max.perDay.toDouble + 1.0).isLeft)
+    assert(RateMultiplier.from(value = Double.NaN).isLeft)
+    assert(RateMultiplier.from(value = Double.PositiveInfinity).isLeft)
+  }
+
+  test("RateMultiplier supports total ordering") {
+    val double = RateMultiplier(value = 2.0)
+
+    assert(RateMultiplier.One < double)
+    assert(double < RateMultiplier.Max)
+    assertEquals(Order[RateMultiplier].compare(x = double, y = RateMultiplier.Max), double.compare(RateMultiplier.Max))
+    assertEquals(
+      Ordering[RateMultiplier].compare(x = double, y = RateMultiplier.Max),
+      double.compare(RateMultiplier.Max)
+    )
+  }
+
   test("repeated rounds of multiplicative decreases and additive increases cannot overflow the representation") {
     val minRate             = Rate(requests = 1, period = 10_000.seconds)
     val maxRate             = Rate(requests = 10_000, period = 1.second)

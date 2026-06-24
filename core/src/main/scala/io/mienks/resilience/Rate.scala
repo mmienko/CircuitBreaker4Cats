@@ -58,6 +58,21 @@ final class Rate private (val perDay: Long) extends AnyVal with Ordered[Rate] {
         denominator = RateReduction.Denominator
       )
     )
+
+  /** Multiplies this rate by a fixed-point factor, rounding up to the next event per day and saturating at
+    * [[Rate.Max]].
+    */
+  def multiplyBy(factor: RateMultiplier): Rate =
+    if (perDay > RateMultiplier.Max.numerator / factor.numerator) Rate.Max
+    else
+      new Rate(
+        perDay = Rate.ceilDivide(
+          numerator = perDay * factor.numerator,
+          denominator = RateMultiplier.Denominator
+        )
+      )
+
+  override def toString: String = s"${perSecond.toString}/second"
 }
 
 object Rate {

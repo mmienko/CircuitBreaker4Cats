@@ -3,7 +3,7 @@ package io.mienks.resilience.adaptiveratelimiter
 import cats.effect.IO
 import cats.effect.testkit.TestControl
 import cats.syntax.all._
-import io.mienks.resilience.Rate
+import io.mienks.resilience.{Rate, RateMultiplier}
 import io.mienks.resilience.adaptiveratelimiter.AdaptiveRateLimiter.FailureGradient._
 import io.mienks.resilience.adaptiveratelimiter.AdaptiveRateLimiter.{AimdRateController, FailureGradient}
 import munit.CatsEffectSuite
@@ -265,6 +265,104 @@ class AimdRateControllerTests extends CatsEffectSuite {
     }
   }
 
+  test("slow start grows the rate exponentially on Insufficient Data (None) signals") {
+    TestControl.executeEmbed {
+      runSignals(
+        config = AimdRateController.Config(
+          initialRate = Rate(requests = 1, period = 1.second),
+          minRate = Rate(requests = 1, period = 1.second),
+          maxRate = Rate(requests = 50, period = 1.second),
+          // Park ticks far in the future so only slow-start moves the rate within the take.
+          rateIncreaseBy =
+            AimdRateController.AimdRateIncrease(rate = Rate(requests = 1, period = 1.second), tickInterval = 1.hour),
+          rateDecreaseBy = 0.5,
+          insufficientDataRateGrowthFactor = 2.0
+        ),
+        signals = fs2.Stream.emits(List.fill(7)(none[FailureGradient])).covary[IO],
+        take = 7
+      ).map(
+        assertRatesEquivalent(
+          _,
+          List(
+            Rate(requests = 1, period = 1.second),
+            Rate(requests = 2, period = 1.second),
+            Rate(requests = 4, period = 1.second),
+            Rate(requests = 8, period = 1.second),
+            Rate(requests = 16, period = 1.second),
+            Rate(requests = 32, period = 1.second),
+            Rate(requests = 50, period = 1.second) // would be 64, but clamped at max
+          )
+        )
+      )
+    }
+  }
+
+  test("slow start growth is capped at ssthresh (last good rate) after a Worsening") {
+    TestControl.executeEmbed {
+      runSignals(
+        config = AimdRateController.Config(
+          initialRate = Rate(requests = 32, period = 1.second),
+          minRate = Rate(requests = 1, period = 1.second),
+          maxRate = Rate(requests = 64, period = 1.second),
+          rateIncreaseBy =
+            AimdRateController.AimdRateIncrease(rate = Rate(requests = 1, period = 1.second), tickInterval = 1.hour),
+          rateDecreaseBy = 0.5,
+          insufficientDataRateGrowthFactor = 2.0
+        ),
+        signals = fs2.Stream
+          .emits(List(FailedSignal.some, none[FailureGradient], none[FailureGradient]))
+          .covary[IO],
+        take = 3
+      ).map(
+        assertRatesEquivalent(
+          _,
+          List(
+            Rate(requests = 32, period = 1.second), // initial
+            Rate(requests = 16, period = 1.second), // Worsening halves; ssthresh captured at 32
+            Rate(requests = 32, period = 1.second)  // slow start climbs back to ssthresh and stops below maxRate (64)
+          )
+        )
+      )
+    }
+  }
+
+  test("slow start rounds fractional fixed-point growth up") {
+    TestControl.executeEmbed {
+      runSignals(
+        config = AimdRateController.Config(
+          initialRate = Rate(perDay = 3L),
+          minRate = Rate.Min,
+          maxRate = Rate(perDay = 20L),
+          rateIncreaseBy = AimdRateController.AimdRateIncrease(rate = Rate.Min, tickInterval = 1.hour),
+          rateDecreaseBy = 0.5,
+          insufficientDataRateGrowthFactor = 1.5
+        ),
+        signals = fs2.Stream.emit(none[FailureGradient]).covary[IO],
+        take = 2
+      ).map(assertRatesEquivalent(_, List(Rate(perDay = 3L), Rate(perDay = 5L))))
+    }
+  }
+
+  test("rejects slow start growth factors not greater than one") {
+    val roundsToOne = 1.0 + 1.0 / (RateMultiplier.Denominator.toDouble * 4.0)
+
+    List(1.0, 0.5, roundsToOne).traverse_ { slowStartGrowthFactor =>
+      assertInvalid(
+        config = BaseConfig.copy(insufficientDataRateGrowthFactor = slowStartGrowthFactor),
+        expectedMessage = "insufficientDataRateGrowthFactor > 1"
+      )
+    }
+  }
+
+  test("rejects non-finite or oversized slow start growth factors") {
+    List(Double.PositiveInfinity, Rate.Max.perDay.toDouble + 1.0).traverse_ { slowStartGrowthFactor =>
+      assertInvalid(
+        config = BaseConfig.copy(insufficientDataRateGrowthFactor = slowStartGrowthFactor),
+        expectedMessage = "failed to convert insufficientDataRateGrowthFactor to fixed point"
+      )
+    }
+  }
+
   test("rejects non-positive additive increase tick intervals") {
     assertInvalid(
       config = BaseConfig.copy(rateIncreaseBy =
@@ -295,8 +393,19 @@ class AimdRateControllerTests extends CatsEffectSuite {
       failureSignals: fs2.Stream[IO, FailureGradient],
       take: Long
   ): IO[List[Rate]] =
+    runSignals(
+      config = config,
+      signals = failureSignals.map(_.some),
+      take = take
+    )
+
+  private def runSignals(
+      config: AimdRateController.Config,
+      signals: fs2.Stream[IO, Option[FailureGradient]],
+      take: Long
+  ): IO[List[Rate]] =
     AdaptiveRateLimiter.AimdRateController[IO](config = config).flatMap { controller =>
-      failureSignals.through(controller).take(take).compile.toList
+      signals.through(controller).take(take).compile.toList
     }
 
   private def assertInvalid(config: AimdRateController.Config, expectedMessage: String): IO[Unit] =
