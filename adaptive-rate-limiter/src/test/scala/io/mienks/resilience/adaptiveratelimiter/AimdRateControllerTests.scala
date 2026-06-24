@@ -54,18 +54,25 @@ class AimdRateControllerTests extends CatsEffectSuite {
     }
   }
 
-  test("ignores Recovering signals") {
+  test("additive increase is paused while Worsening and Recovering, then resumes after Recovered") {
     TestControl.executeEmbed {
       run(
         config = BaseConfig,
-        failureSignals = fs2.Stream(Recovering(fromLevel = 1)).covary[IO],
-        take = 2
+        failureSignals = (
+          fs2.Stream.emit(FailedSignal) ++
+            fs2.Stream.sleep_[IO](160.millis) ++
+            fs2.Stream.emit(Recovering(fromLevel = 1)) ++
+            fs2.Stream.sleep_[IO](160.millis) ++
+            fs2.Stream.emit(Recovered)
+        ).covary[IO],
+        take = 3
       ).map(
         assertRatesEquivalent(
           _,
           List(
             InitialRate,
-            Rate(requests = 11, period = 1.second)
+            Rate(requests = 5, period = 1.second),
+            Rate(requests = 6, period = 1.second)
           )
         )
       )
@@ -166,7 +173,7 @@ class AimdRateControllerTests extends CatsEffectSuite {
           ),
           rateDecreaseBy = 0.9
         ),
-        failureSignals = fs2.Stream.emit(FailedSignal).covary[IO],
+        failureSignals = fs2.Stream.emits(List(FailedSignal, Recovered)).covary[IO],
         take = 7
       ).map(
         assertRatesEquivalent(
@@ -198,7 +205,7 @@ class AimdRateControllerTests extends CatsEffectSuite {
           ),
           rateDecreaseBy = 0.5
         ),
-        failureSignals = fs2.Stream(FailedSignal, FailedSignal).covary[IO],
+        failureSignals = fs2.Stream(FailedSignal, FailedSignal, Recovered).covary[IO],
         take = 5
       ).map(
         assertRatesEquivalent(
@@ -228,7 +235,7 @@ class AimdRateControllerTests extends CatsEffectSuite {
           ),
           rateDecreaseBy = 0.5
         ),
-        failureSignals = fs2.Stream(FailedSignal).covary[IO],
+        failureSignals = fs2.Stream(FailedSignal, Recovered).covary[IO],
         take = 5
       ).map(
         assertRatesEquivalent(

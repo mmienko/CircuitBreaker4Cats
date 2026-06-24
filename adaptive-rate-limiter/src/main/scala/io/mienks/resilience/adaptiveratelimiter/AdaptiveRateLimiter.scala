@@ -308,6 +308,9 @@ object AdaptiveRateLimiter {
         } yield ()
     }
 
+    /** @return
+      *   failureRates; `None` means the window held too few samples
+      */
     private[adaptiveratelimiter] def createProducerAndConsumer[F[_]: Async](
         config: Config
     ): F[(SampledMeasurements[F], fs2.Stream[F, Option[Double]])] =
@@ -439,7 +442,15 @@ object AdaptiveRateLimiter {
 
     private case object Tick
 
-    private final case class State(rate: Rate, insufficientDataThreshold: Rate)
+    /** @param rate
+      *   current estimated rate
+      * @param insufficientDataThreshold
+      *   the last pre-decrease rate above which slow-start stops growing exponentially (`ssthresh` in TCP), i.e. The
+      *   last "good" rate where measurements produce enough samples.
+      * @param healthy
+      *   whether the state is in the healthy band
+      */
+    private final case class State(rate: Rate, insufficientDataThreshold: Rate, healthy: Boolean)
 
     private[adaptiveratelimiter] def apply[F[_]: Temporal](
         config: AimdRateController.Config
@@ -491,18 +502,22 @@ object AdaptiveRateLimiter {
         .merge(ticks)
         // insufficientDataThreshold starts high (maxRate) so the initial slow start can climb the full range,
         // mirroring TCP's ssthresh settings.
-        .scan(State(rate = initialRate, insufficientDataThreshold = maxRate)) {
+        .scan(State(rate = initialRate, insufficientDataThreshold = maxRate, healthy = true)) {
           case (state, Right(Some(FailureGradient.Worsening(_)))) =>
             // Multiplicative Decrease: Drop the rate
-            State(
+            state.copy(
               rate = state.rate.reduceBy(factor = multiplicativeDecrease).max(minRate),
               // memorize last known good rate to avoid overshooting
-              insufficientDataThreshold = state.rate
+              insufficientDataThreshold = state.rate,
+              healthy = false
             )
-          case (state, Right(Some(_))) =>
+          case (state, Right(Some(FailureGradient.Recovered))) =>
+            // Fully recovered: resume additive probing
+            state.copy(healthy = true)
+          case (state, Right(Some(FailureGradient.Recovering(_)))) =>
             state
           case (state, Right(None)) =>
-            // Slow Start: Discover the rate when not enough samples, until the last known rate which produced samples to avoid overshooting.
+            // Slow Start (not enough samples): Discover the rate. Avoid overshooting by capping at last known rate which produced samples.
             state.copy(rate =
               state.rate
                 .multiplyBy(factor = slowStartGrowthFactor)
@@ -511,7 +526,8 @@ object AdaptiveRateLimiter {
             )
           case (state, Left(Tick)) =>
             // Additive Increase: Grow the rate
-            state.copy(rate = (state.rate + rateIncreaseBy.rate).min(maxRate))
+            if (state.healthy) state.copy(rate = (state.rate + rateIncreaseBy.rate).min(maxRate))
+            else state
         }
         .map(_.rate)
         .changes
