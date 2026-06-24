@@ -24,40 +24,38 @@ class ApproximateFailureRatesTests extends CatsEffectSuite {
     for {
       producerConsumer <- ApproximateFailureRates.createProducerAndConsumer[IO](config = BaseConfig)
       (measurements, failureRates) = producerConsumer
-      ratios <- Queue.unbounded[IO, Double]
-      fiber  <- failureRates.evalMap(ratios.offer).compile.drain.start
+      samples <- Queue.unbounded[IO, Option[Double]]
+      fiber   <- failureRates.evalMap(samples.offer).compile.drain.start
       waitForSampling = IO.sleep(MeasurementPeriod)
 
-      // no measurements
+      // no measurements: the window is uninitialized, so the producer reports None
       _ <- waitForSampling
-      _ <- ratios.tryTake.map(assertEquals(_, None))
+      _ <- pollUntil(samples)(assertEquals(_, none[Double]))
 
       // only errors
       _ <- measurements.recordFailure.replicateA_(4)
       _ <- waitForSampling
-      _ <- pollUntil(ratios)(ratio => assertEquals(ratio, 1.0))
+      _ <- pollUntilMeasured(samples)(ratio => assertEquals(ratio, 1.0))
 
       // mostly success
       _ <- measurements.recordSuccess.replicateA_(100)
       _ <- waitForSampling
-      _ <- pollUntil(ratios)(ratio => assert(ratio <= 0.1, clue = ratio))
+      _ <- pollUntilMeasured(samples)(ratio => assert(ratio <= 0.1, clue = ratio))
 
       // no change
       _ <- waitForSampling
-      _ <- pollUntil(ratios)(ratio => assert(ratio <= 0.1, clue = ratio))
+      _ <- pollUntilMeasured(samples)(ratio => assert(ratio <= 0.1, clue = ratio))
 
-      // clear/waitForSampling until not enough measurements
+      // clear/waitForSampling until not enough measurements: window de-initializes back to None
       _ <- IO.sleep(BaseConfig.measurementWindow * 2)
-      _ <- ratios.tryTakeN(maxN = None).map(rs => assert(rs.forall(_ <= 0.1), clue = rs))
-      _ <- waitForSampling
-      _ <- ratios.tryTake.map(assertEquals(_, None))
+      _ <- samples.tryTakeN(maxN = None)
+      _ <- pollUntil(samples)(assertEquals(_, none[Double]))
 
       // mixed signals
       _ <- measurements.recordFailure.replicateA_(50)
       _ <- measurements.recordSuccess.replicateA_(50)
-      _ <- ratios.tryTakeN(maxN = None)
-      _ <- waitForSampling
-      _ <- pollUntil(ratios)(ratio => assertEquals(ratio, 0.5))
+      _ <- samples.tryTakeN(maxN = None)
+      _ <- pollUntilMeasured(samples)(ratio => assertEquals(ratio, 0.5))
 
       _ <- fiber.cancel
     } yield ()
@@ -81,14 +79,21 @@ class ApproximateFailureRatesTests extends CatsEffectSuite {
       assert(msg.contains(expectedMessage), clue = msg)
     }
 
-  private def pollUntil(ratios: Queue[IO, Double])(check: Double => Unit): IO[Unit] = {
+  private def pollUntil(samples: Queue[IO, Option[Double]])(check: Option[Double] => Unit): IO[Unit] = {
     val PollTimeout = 2.seconds
 
     def loop: IO[Unit] =
-      ratios.take.flatMap { ratio =>
-        IO(check(ratio)).handleErrorWith(_ => loop)
+      samples.take.flatMap { sample =>
+        IO(check(sample)).handleErrorWith(_ => loop)
       }
 
     loop.timeout(PollTimeout)
   }
+
+  /** Polls until a `Some(ratio)` satisfies `check`, skipping any `None` (too few measurements). */
+  private def pollUntilMeasured(samples: Queue[IO, Option[Double]])(check: Double => Unit): IO[Unit] =
+    pollUntil(samples) {
+      case Some(ratio) => check(ratio)
+      case None        => throw new AssertionError("expected a measured ratio, got: None")
+    }
 }

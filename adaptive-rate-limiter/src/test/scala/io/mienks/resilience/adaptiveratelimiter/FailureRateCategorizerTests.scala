@@ -19,11 +19,18 @@ class FailureRateCategorizerTests extends CatsEffectSuite {
       failureRates = failureRates
     )
 
-  /** Runs a timeseries of sampled failure rates and returns the failure-category signals. */
+  /** Runs a timeseries of sampled failure rates and returns the failure-category gradients. */
   private def runWithBands(bands: NonEmptyList[HysteresisBand], failureRates: Seq[Double]): IO[List[FailureGradient]] =
+    runSamples(bands = bands, samples = failureRates.map(_.some)).map(_.flatten)
+
+  /** Runs a timeseries of raw samples (`None` = too few measurements) and returns the emitted signals. */
+  private def runSamples(
+      bands: NonEmptyList[HysteresisBand],
+      samples: Seq[Option[Double]]
+  ): IO[List[Option[FailureGradient]]] =
     FailureRateCategorizer[IO](config = FailureRateCategorizer.Config(failureLevels = bands)).flatMap { categorizer =>
       fs2.Stream
-        .emits(failureRates.toList)
+        .emits(samples.toList)
         .covary[IO]
         .through(categorizer)
         .compile
@@ -261,5 +268,28 @@ class FailureRateCategorizerTests extends CatsEffectSuite {
           )
         )
       )
+  }
+
+  test("None samples pass through unchanged without advancing failure state") {
+    runSamples(
+      bands = NonEmptyList.one(HysteresisBand(exit = 0.2, start = 0.5)),
+      samples = List(
+        none[Double], // emitted, state held at Healthy
+        0.6.some,     // worsens to band 0
+        none[Double], // emitted, state held at Failing(0)
+        0.6.some,     // still Failing(0) -> no change
+        0.0.some      // recovers
+      )
+    ).map(
+      assertEquals(
+        _,
+        List(
+          none[FailureGradient],
+          Worsening(toLevel = 0).some,
+          none[FailureGradient],
+          Recovered.some
+        )
+      )
+    )
   }
 }

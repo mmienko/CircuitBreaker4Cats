@@ -107,6 +107,10 @@ object AdaptiveRateLimiter {
     *   the sliding window must hold at least this many samples before the failure ratio is reported
     * @param failureLevels
     *   ordered (least- to most-severe) hysteresis bands keyed on failure ratio
+    * @param insufficientDataRateGrowthFactor
+    *   rate multiplier (`> 1`) while the window doesn't have enough samples, i.e. samples are below
+    *   `minNumberOfMeasurements` (window doesn't know the failure rate). Similar to TCP-style slow-start, the estimated
+    *   rate is grown by this factor to quickly re-initialize measurements
     */
   final case class Config(
       capacity: Int,
@@ -120,7 +124,8 @@ object AdaptiveRateLimiter {
       slotDuration: FiniteDuration,
       measurementPeriod: FiniteDuration,
       minNumberOfMeasurements: Int,
-      failureLevels: NonEmptyList[HysteresisBand]
+      failureLevels: NonEmptyList[HysteresisBand],
+      insufficientDataRateGrowthFactor: Double = Config.DefaultSlowStartGrowthFactor
   ) {
 
     val rateLimiterConfig =
@@ -145,14 +150,20 @@ object AdaptiveRateLimiter {
         rate = rateIncreaseBy,
         tickInterval = rateIncreasePeriod
       ),
-      rateDecreaseBy = rateDecreaseBy
+      rateDecreaseBy = rateDecreaseBy,
+      insufficientDataRateGrowthFactor = insufficientDataRateGrowthFactor
     )
   }
 
   object Config {
 
+    val DefaultSlowStartGrowthFactor: Double = 2.0
+
     /** Convenience builder for RPS-shaped configurations. Capacity is set to `maxRps`, the bucket window covers
       * `timeRangeForMeasurementInSeconds` one-second slots, and `minNumberOfMeasurements` equals the slot count.
+      *
+      * @see
+      *   [[AdaptiveRateLimiter.Config]] for parameter descriptions.
       */
     def fromRps(
         minRps: Int,
@@ -160,7 +171,8 @@ object AdaptiveRateLimiter {
         rpsIncreaseRate: Rate,
         rpsDecrease: Double,
         timeRangeForMeasurementInSeconds: Int,
-        failureLevels: NonEmptyList[HysteresisBand]
+        failureLevels: NonEmptyList[HysteresisBand],
+        slowStartGrowthFactor: Double = DefaultSlowStartGrowthFactor
     ): Config =
       Config(
         capacity = maxRps,
@@ -174,7 +186,8 @@ object AdaptiveRateLimiter {
         slotDuration = 1.second,
         measurementPeriod = 1.second,
         minNumberOfMeasurements = timeRangeForMeasurementInSeconds,
-        failureLevels = failureLevels
+        failureLevels = failureLevels,
+        insufficientDataRateGrowthFactor = slowStartGrowthFactor
       )
   }
 
@@ -242,9 +255,9 @@ object AdaptiveRateLimiter {
 
       _ <- Spawn[F].background {
         failureRates
-          .evalTap(adaptiveRateLimiter.setFailureRatio)
+          .evalTap(_.traverse_(adaptiveRateLimiter.setFailureRatio))
           .through(failureRateCategorizer)
-          .evalTap(onFailureCategoryChange)
+          .evalTap(_.traverse_(onFailureCategoryChange))
           .through(aimdRateController)
           .evalTap(onRateChange)
           .evalMap(rateLimiter.setRefillRate)
@@ -272,9 +285,12 @@ object AdaptiveRateLimiter {
         } yield ()
     }
 
+    /** @return
+      *   failureRates; `None` means the window held too few samples
+      */
     private[adaptiveratelimiter] def createProducerAndConsumer[F[_]: Async](
         config: Config
-    ): F[(SampledMeasurements[F], fs2.Stream[F, Double])] =
+    ): F[(SampledMeasurements[F], fs2.Stream[F, Option[Double]])] =
       for {
         _            <- ApplicativeThrow[F].fromEither(config.validate.leftMap(new IllegalArgumentException(_)))
         measurements <- Measurements.sampledTimeBasedSlidingWindow[F](
@@ -288,14 +304,13 @@ object AdaptiveRateLimiter {
           .awakeEvery[F](period = config.measurementPeriod)
           .evalMap(_ => measurements.sample)
           .map(_.failureRate)
-          .unNone
       )
 
   }
 
   private[adaptiveratelimiter] object FailureRateCategorizer {
 
-    private val NoChange = Chunk.empty[FailureGradient]
+    private val NoChange = Chunk.empty[Option[FailureGradient]]
 
     private sealed abstract class FailureState extends Product with Serializable {
       def level: Int
@@ -334,50 +349,56 @@ object AdaptiveRateLimiter {
         } yield ()
     }
 
-    def apply[F[_]: ApplicativeThrow](config: Config): F[Pipe[F, Double, FailureGradient]] =
+    def apply[F[_]: ApplicativeThrow](config: Config): F[Pipe[F, Option[Double], Option[FailureGradient]]] =
       for {
         _ <- ApplicativeThrow[F].fromEither(config.validate.leftMap(new IllegalArgumentException(_)))
       } yield failureRateCategorizer(bands = config.failureLevels)
 
     private def failureRateCategorizer[F[_]](
         bands: NonEmptyList[HysteresisBand]
-    ): Pipe[F, Double, FailureGradient] = {
+    ): Pipe[F, Option[Double], Option[FailureGradient]] = {
       /*
       Bands are ordered least-severe first (band 0 is the least severe). Hysteresis prevents flapping: a band engages
-      at `start` and releases at `exit`. Every state transition emits one [[FailureGradient]] event per band crossed.
+      at `start` and releases at `exit`. Every state transition emits one `Some(FailureGradient)` per band crossed.
+      A `None` input (too few samples to report a ratio) is passed through unchanged as `None` without advancing the
+      failure state: we cannot categorize, so we hold the last known state.
        */
       val bandsArr = bands.toList.toArray // already sorted in validation above
 
-      def worsening(currentLevel: Int, nextLevel: Int): Chunk[FailureGradient] =
-        Chunk.from(((currentLevel + 1) to nextLevel).map(FailureGradient.Worsening(_)))
+      def worsening(currentLevel: Int, nextLevel: Int): Chunk[Option[FailureGradient]] =
+        Chunk.from(((currentLevel + 1) to nextLevel).map(FailureGradient.Worsening(_).some))
 
-      def recovering(currentLevel: Int, nextLevel: Int): Chunk[FailureGradient] =
+      def recovering(currentLevel: Int, nextLevel: Int): Chunk[Option[FailureGradient]] =
         Chunk.from((currentLevel until nextLevel by -1).map {
           // Fully releasing band 0 means the backend is healthy again.
-          case 0     => FailureGradient.Recovered
-          case level => FailureGradient.Recovering(fromLevel = level)
+          case 0     => FailureGradient.Recovered.some
+          case level => FailureGradient.Recovering(fromLevel = level).some
         })
 
-      _.scan((FailureState.Healthy: FailureState, NoChange)) { case ((current, _), failureRate) =>
-        val currentLevel = current.level
+      _.scan((FailureState.Healthy: FailureState, NoChange)) {
+        case ((current, _), None) =>
+          (current, Chunk.singleton(none[FailureGradient]))
 
-        // Start thresholds engage bands; exit thresholds keep already-engaged bands retained during recovery.
-        val worseningTo  = bandsArr.lastIndexWhere(band => band.start <= failureRate)
-        val recoveringTo = bandsArr.lastIndexWhere(band => band.exit < failureRate)
+        case ((current, _), Some(failureRate)) =>
+          val currentLevel = current.level
 
-        if (worseningTo > currentLevel)
-          (
-            FailureState(level = worseningTo),
-            worsening(currentLevel = currentLevel, nextLevel = worseningTo)
-          )
-        // If the current level is no longer retained by its exit threshold, emit one recovery event per released band.
-        else if (recoveringTo < currentLevel)
-          (
-            FailureState(level = recoveringTo),
-            recovering(currentLevel = currentLevel, nextLevel = recoveringTo)
-          )
-        else
-          (current, NoChange)
+          // Start thresholds engage bands; exit thresholds keep already-engaged bands retained during recovery.
+          val worseningTo  = bandsArr.lastIndexWhere(band => band.start <= failureRate)
+          val recoveringTo = bandsArr.lastIndexWhere(band => band.exit < failureRate)
+
+          if (worseningTo > currentLevel)
+            (
+              FailureState(level = worseningTo),
+              worsening(currentLevel = currentLevel, nextLevel = worseningTo)
+            )
+          // If the current level is no longer retained by its exit threshold, emit one recovery event per released band.
+          else if (recoveringTo < currentLevel)
+            (
+              FailureState(level = recoveringTo),
+              recovering(currentLevel = currentLevel, nextLevel = recoveringTo)
+            )
+          else
+            (current, NoChange)
       }.collect { case (_, gradients) => gradients }.unchunks
     }
 
@@ -392,14 +413,23 @@ object AdaptiveRateLimiter {
         minRate: Rate,
         maxRate: Rate,
         rateIncreaseBy: AimdRateIncrease,
-        rateDecreaseBy: Double
+        rateDecreaseBy: Double,
+        insufficientDataRateGrowthFactor: Double = 2.0
     )
 
     private case object Tick
 
+    /** @param rate
+      *   current estimated rate
+      * @param insufficientDataThreshold
+      *   the last pre-decrease rate above which slow-start stops growing exponentially (`ssthresh` in TCP), i.e. The
+      *   last "good" rate where measurements produce enough samples.
+      */
+    private final case class State(rate: Rate, insufficientDataThreshold: Rate)
+
     private[adaptiveratelimiter] def apply[F[_]: Temporal](
         config: AimdRateController.Config
-    ): F[Pipe[F, FailureGradient, Rate]] =
+    ): F[Pipe[F, Option[FailureGradient], Rate]] =
       ApplicativeThrow[F]
         .fromEither {
           import config._
@@ -412,6 +442,7 @@ object AdaptiveRateLimiter {
             _ <- check(rateIncreaseBy.tickInterval > Duration.Zero, "rateIncreaseBy.tickInterval > 0ms")
             _ <- check(minRate <= initialRate && initialRate <= maxRate, "min rate <= initial rate <= max rate")
             _ <- check(rateDecreaseBy >= 0.0 && rateDecreaseBy <= 1.0, "0 <= rateDecreaseBy <= 1")
+            _ <- check(insufficientDataRateGrowthFactor > 1.0, "insufficientDataRateGrowthFactor > 1")
           } yield ())
             .leftMap(new IllegalArgumentException(_))
         }
@@ -424,7 +455,8 @@ object AdaptiveRateLimiter {
             minRate = config.minRate,
             maxRate = config.maxRate,
             rateIncreaseBy = config.rateIncreaseBy,
-            multiplicativeDecrease = multiplicativeDecrease
+            multiplicativeDecrease = multiplicativeDecrease,
+            slowStartGrowthFactor = config.insufficientDataRateGrowthFactor
           )
         }
 
@@ -433,24 +465,38 @@ object AdaptiveRateLimiter {
         minRate: Rate,
         maxRate: Rate,
         rateIncreaseBy: AimdRateIncrease,
-        multiplicativeDecrease: Double
-    ): Pipe[F, FailureGradient, Rate] = { failureSignals =>
+        multiplicativeDecrease: Double,
+        slowStartGrowthFactor: Double
+    ): Pipe[F, Option[FailureGradient], Rate] = { failureSignals =>
       val ticks =
         fs2.Stream
           .awakeEvery[F](period = rateIncreaseBy.tickInterval)
-          .map(_ => Tick.asLeft[FailureGradient])
+          .as(Tick.asLeft[Option[FailureGradient]])
 
       failureSignals
         .map(_.asRight[Tick.type])
         .merge(ticks)
-        .scan(initialRate) {
-          case (rate, Right(FailureGradient.Worsening(_))) =>
-            rate.scaleBy(multiplicativeDecrease).max(minRate)
-          case (rate, Right(_)) =>
-            rate
-          case (rate, Left(Tick)) =>
-            (rate + rateIncreaseBy.rate).min(maxRate)
+        // insufficientDataThreshold starts high (maxRate) so the initial slow start can climb the full range,
+        // mirroring TCP's ssthresh settings.
+        .scan(State(rate = initialRate, insufficientDataThreshold = maxRate)) {
+          case (state, Right(Some(FailureGradient.Worsening(_)))) =>
+            // Multiplicative Decrease: Drop the rate
+            State(
+              rate = state.rate.scaleBy(multiplicativeDecrease).max(minRate),
+              insufficientDataThreshold = state.rate
+            )
+          case (state, Right(Some(_))) =>
+            state
+          case (state, Right(None)) =>
+            // Slow Start: Discover the rate when not enough samples, until the last known rate which produced samples to avoid overshooting.
+            state.copy(rate =
+              state.rate.scaleBy(slowStartGrowthFactor).min(state.insufficientDataThreshold).min(maxRate)
+            )
+          case (state, Left(Tick)) =>
+            // Additive Increase: Grow the rate
+            state.copy(rate = (state.rate + rateIncreaseBy.rate).min(maxRate))
         }
+        .map(_.rate)
         .changes
     }
   }
