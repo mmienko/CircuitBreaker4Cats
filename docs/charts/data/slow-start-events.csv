@@ -1,0 +1,16 @@
+elapsed_ms,kind,detail
+501,rate_change,20.0
+793,rate_change,22.0
+852,rate_change,24.0
+872,rate_change,48.0
+953,rate_change,50.0
+999,rate_change,52.0
+1078,rate_change,54.0
+1081,rate_change,108.0
+1148,rate_change,110.0
+1228,rate_change,112.0
+1286,rate_change,224.0
+1309,rate_change,226.0
+1391,rate_change,228.0
+1547,rate_change,230.0
+1593,rate_change,400.0

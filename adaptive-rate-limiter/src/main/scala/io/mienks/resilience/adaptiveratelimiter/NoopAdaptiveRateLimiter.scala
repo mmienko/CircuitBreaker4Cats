@@ -22,5 +22,5 @@ class NoopAdaptiveRateLimiter[F[_]: Applicative](
 
   override def rate: F[Rate] = configuredRate.pure[F]
 
-  override def failureRatio: F[Double] = 0.0.pure[F]
+  override def failureRatio: F[Option[Double]] = none[Double].pure[F]
 }

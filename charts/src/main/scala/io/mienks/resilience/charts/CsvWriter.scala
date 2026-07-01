@@ -19,7 +19,7 @@ final case class ManifestEntry(
 object CsvWriter {
 
   private val SamplesHeader: String =
-    "elapsed_ms,aimd_rps,admitted_rps,backend_capacity_rps,observed_failure_ratio"
+    "elapsed_ms,aimd_rps,admitted_rps,backend_capacity_rps,observed_failure_ratio,slow_start_active"
   private val EventsHeader: String   = "elapsed_ms,kind,detail"
   private val ManifestHeader: String = "scenario,description,samples_file,events_file"
 
@@ -34,7 +34,8 @@ object CsvWriter {
           s"${sample.aimdRps.toString}," +
           s"${sample.admittedRps.toString}," +
           s"${sample.backendCapacityRps.toString}," +
-          sample.observedFailureRatio.toString
+          s"${sample.observedFailureRatio.toString}," +
+          (if (sample.slowStartActive) "1" else "0")
       }).mkString("\n")
 
     val rateRows =

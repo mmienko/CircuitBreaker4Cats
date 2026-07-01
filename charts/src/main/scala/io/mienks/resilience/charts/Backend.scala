@@ -6,7 +6,7 @@ import cats.syntax.all._
 import io.mienks.resilience.Rate
 import io.mienks.resilience.ratelimiter.{DynamicRateLimiter, RateLimiter}
 
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration._
 import scala.util.Random
 
 /** A simulated downstream resource whose health is a function of the offered load.
@@ -25,6 +25,9 @@ trait Backend[F[_]] {
 
   /** The active phase's hard ceiling (the bottleneck the limiter is trying to discover). */
   def baseCapacity: F[Rate]
+
+  /** The active phase's offered load: the aggregate rate the workload should drive against the limiter. */
+  def offeredLoad: F[Rate]
 }
 
 object Backend {
@@ -37,8 +40,20 @@ object Backend {
     )
   }
 
-  /** One leg of a backend schedule: hold the backend at `hardCeiling` (plus `softCeilings`) for `duration`. */
-  final case class Phase(hardCeiling: Rate, softCeilings: List[SoftCeiling], duration: FiniteDuration)
+  /** One leg of a backend schedule: hold the backend at `hardCeiling` (plus `softCeilings`) for `duration`, with the
+    * workload offering `offeredLoad`. The default offered load comfortably exceeds any limiter `maxRate`, so the
+    * admitted throughput tracks the limiter's refill rate (the historical harness behavior); lower it to starve the
+    * measurement window and exercise the limiter's slow-start.
+    */
+  final case class Phase(
+      hardCeiling: Rate,
+      softCeilings: List[SoftCeiling],
+      duration: FiniteDuration,
+      offeredLoad: Rate = DefaultOfferedLoad
+  )
+
+  /** Offered load high enough to swamp any limiter `maxRate`, so admitted throughput tracks the refill rate. */
+  val DefaultOfferedLoad: Rate = Rate(requests = 4000, period = 1.second)
 
   // Burst tokens per ceiling; kept small so each limiter behaves like a rate ceiling rather than a buffer.
   private val BurstCapacity: Int = 8
@@ -57,6 +72,7 @@ object Backend {
         }
       )
       capacity             <- Resource.eval(Ref[IO].of(initialPhase.hardCeiling))
+      offeredLoadRef       <- Resource.eval(Ref[IO].of(initialPhase.offeredLoad))
       failProbabilitiesRef <- Resource.eval(Ref[IO].of(failProbabilities(initialPhase)))
 
       _ <- schedule.traverse_ { phase =>
@@ -67,12 +83,14 @@ object Backend {
         updateBuckets >>
           failProbabilitiesRef.set(failProbabilities(phase)) >>
           capacity.set(phase.hardCeiling) >>
+          offeredLoadRef.set(phase.offeredLoad) >>
           IO.sleep(phase.duration)
       }.background
     } yield new TokenBucketBackend(
       buckets = buckets,
       failProbabilitiesRef = failProbabilitiesRef,
       capacity = capacity,
+      offeredLoadRef = offeredLoadRef,
       rng = rng
     )
   }
@@ -87,6 +105,7 @@ object Backend {
       buckets: NonEmptyList[DynamicRateLimiter[IO]],
       failProbabilitiesRef: Ref[IO, NonEmptyList[Double]],
       capacity: Ref[IO, Rate],
+      offeredLoadRef: Ref[IO, Rate],
       rng: Random
   ) extends Backend[IO] {
 
@@ -103,5 +122,7 @@ object Backend {
       } yield admit
 
     override def baseCapacity: IO[Rate] = capacity.get
+
+    override def offeredLoad: IO[Rate] = offeredLoadRef.get
   }
 }

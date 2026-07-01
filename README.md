@@ -184,6 +184,7 @@ the underlying `DynamicRateLimiter` is always configured at that estimate.
 - `numberOfSlotsForMeasurements` / `slotDuration` — time-bucket slots in the failure-rate sliding window
 - `measurementPeriod` — how often the background fiber samples counters
 - `minNumberOfMeasurements` — minimum samples before a failure ratio is reported
+- `insufficientDataRateGrowthFactor` — slow-start multiplier (`> 1`); while the window holds fewer than `minNumberOfMeasurements` samples the estimate is grown by this factor each window to re-initialize measurements (defaults to `2.0`, TCP-style doubling)
 - `failureLevels` — ordered (least- to most-severe) hysteresis bands on failure ratio
 
 Each `HysteresisBand` has an `exit` and `start` threshold (`start >= exit`). A band engages when the failure ratio
@@ -205,7 +206,11 @@ AdaptiveRateLimiter.start[IO](
 
 The categorizer emits `FailureGradient.Worsening(level)` (one event per band crossed on worsening),
 `FailureGradient.Recovering(fromLevel)` on partial recovery, and `FailureGradient.Recovered` on full recovery. The AIMD
-controller multiplicatively decreases only on `Worsening` and additively increases on a fixed tick.
+controller multiplicatively decreases on every `Worsening` and additively increases on a fixed tick, but the additive
+increase is gated on health: probing pauses once a band trips and resumes only after `Recovered`. When the window
+holds too few samples to report a ratio, the controller has no signal to act on, so it runs TCP-style slow-start —
+growing the estimate by `insufficientDataRateGrowthFactor` each window — to escape the low-rate live-lock and
+re-initialize measurements.
 
 ### Behavior
 
@@ -214,6 +219,12 @@ TCP-style sawtooth: additive increase probes for more throughput until the backe
 decrease backs off.
 
 ![congestion-sawtooth](docs/images/adaptive-rate-limiter/congestion-sawtooth.png)
+
+If the offered load falls below the sampling floor, no window collects enough samples to report a failure ratio. Rather
+than deadlock at a low rate (additive increase is paused while unhealthy), the limiter runs TCP-style slow-start,
+blindly doubling the estimate each window until load returns or it reaches `maxRate`.
+
+![slow-start](docs/images/adaptive-rate-limiter/slow-start.png)
 
 See [`charts/`](charts/README.md) for how these charts are generated and for more scenarios (degradation, recovery,
 flapping, and graded multi-tier backends).

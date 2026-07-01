@@ -12,10 +12,10 @@ import scala.concurrent.duration._
 
 object SimulationRunner {
 
-  // Number of client fibers hitting the backend roughly every ClientInterval. The offered load comfortably exceeds
-  // maxRate and the admitted rate tracks the limiter's current refill rate.
-  private val NumberOfClients: Int           = 4
-  private val ClientInterval: FiniteDuration = 1.millis
+  // Client fibers hitting the backend. Each paces itself to its share of the active phase's offered load, so the
+  // aggregate offered rate tracks Backend.offeredLoad: at the default (full) load the admitted rate tracks the
+  // limiter's refill rate, and a starved phase drives the measurement window into the insufficient-data regime.
+  private val NumberOfClients: Int = 4
 
   // Sampled finer than the slot duration so band crossings and rate cuts are visible in the timeseries.
   private val SamplePeriod: FiniteDuration = 50.millis
@@ -41,7 +41,7 @@ object SimulationRunner {
           fa = recorder.countAdmitted >> backend.call,
           isError = (ok: Boolean) => !ok,
           orElse = true
-        ) >> IO.sleep(ClientInterval)
+        ) >> backend.offeredLoad.flatMap(load => IO.sleep(clientInterval(load)))
 
         takeSample =
           for {
@@ -51,7 +51,9 @@ object SimulationRunner {
             _        <- recorder.recordSample(
               aimdRps = toRps(rate),
               backendCapacityRps = toRps(capacity),
-              observedFailureRatio = observed
+              // None means the window was starved (slow-start regime); report a 0.0 ratio but flag it as slow-start.
+              observedFailureRatio = observed.getOrElse(0.0),
+              slowStartActive = observed.isEmpty
             )
           } yield ()
 
@@ -67,6 +69,10 @@ object SimulationRunner {
 
   private def toRps(rate: Rate): Double =
     rate.eventsPer(unit = TimeUnit.SECONDS)
+
+  /** Per-client inter-arrival gap so the `NumberOfClients` fibers together offer `offeredLoad`. */
+  private def clientInterval(offeredLoad: Rate): FiniteDuration =
+    (offeredLoad.emissionIntervalNanos * NumberOfClients.toLong).nanos
 
   /** Mutable, in-flight recording for a single run: the sampled timeseries, the discrete control-loop events, and the
     * admitted-request counter used to derive throughput.
@@ -91,7 +97,12 @@ object SimulationRunner {
       elapsedMillis.flatMap(ms => gradientEventsRef.update(_ :+ (ms, event)))
 
     /** Append a sample, deriving admitted throughput from the delta since the previous sample. */
-    def recordSample(aimdRps: Double, backendCapacityRps: Double, observedFailureRatio: Double): IO[Unit] =
+    def recordSample(
+        aimdRps: Double,
+        backendCapacityRps: Double,
+        observedFailureRatio: Double,
+        slowStartActive: Boolean
+    ): IO[Unit] =
       for {
         now      <- IO.monotonic
         admitted <- admittedRef.get
@@ -105,7 +116,8 @@ object SimulationRunner {
             aimdRps = aimdRps,
             admittedRps = admittedRps,
             backendCapacityRps = backendCapacityRps,
-            observedFailureRatio = observedFailureRatio
+            observedFailureRatio = observedFailureRatio,
+            slowStartActive = slowStartActive
           )
         )
       } yield ()
@@ -152,13 +164,16 @@ object SimulationRunner {
     *   the backend's current hard-ceiling capacity (the bottleneck the AIMD is trying to discover)
     * @param observedFailureRatio
     *   the limiter's sampled failure ratio in `[0, 1]`
+    * @param slowStartActive
+    *   whether the limiter's window was starved (insufficient data) at this sample, i.e. the slow-start regime
     */
   final case class Sample(
       elapsedMillis: Long,
       aimdRps: Double,
       admittedRps: Double,
       backendCapacityRps: Double,
-      observedFailureRatio: Double
+      observedFailureRatio: Double,
+      slowStartActive: Boolean
   )
 
   /** Everything a chart needs for one scenario: the dense sampled timeseries plus the discrete control-loop events. */
