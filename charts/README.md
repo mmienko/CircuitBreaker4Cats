@@ -28,7 +28,8 @@ This drives every [`Scenario`](src/main/scala/io/mienks/resilience/charts/Scenar
 parallel) and writes, under `docs/charts/data/`:
 
 - `<scenario>-samples.csv` — the dense sampled timeseries (`elapsed_ms`, `aimd_rps`, `admitted_rps`,
-  `backend_capacity_rps`, `observed_failure_ratio`).
+  `backend_capacity_rps`, `observed_failure_ratio`, `slow_start_active`). `slow_start_active` is `1` while the
+  measurement window was starved (insufficient data) and the limiter ran on slow-start, `0` otherwise.
 - `<scenario>-events.csv` — discrete control-loop events (rate changes and `FailureGradient` band crossings).
 - `manifest.csv` — the index of scenarios the renderer reads.
 
@@ -85,6 +86,12 @@ shared `Warmup` settle time is folded into the first phase's duration.
 [`SimulationRunner`](src/main/scala/io/mienks/resilience/charts/SimulationRunner.scala) offers load through
 `limiter.protect`, samples the limiter's rate/failure-ratio on a fixed cadence, and records every control-loop event.
 
+Each `Backend.Phase` also carries an `offeredLoad` (defaulting to a rate well above any limiter `maxRate`), and the
+client fibers pace themselves so the aggregate offered rate tracks it. At the default (full) load the admitted rate
+tracks the limiter's refill rate, exactly as before. Dropping `offeredLoad` *below the sampling floor*
+(`minNumberOfMeasurements / measurementWindow`) starves every window so the limiter reports insufficient data and
+enters slow-start — the mechanism the [slow-start](#slow-start) scenario exercises.
+
 > Note: rates are kept in the hundreds of rps even though the time scale is compressed to a few seconds. The closed
 > loop derives the failure ratio from requests the limiter *actually admits*, so each measurement window needs enough
 > admitted requests for the ratio to be meaningful.
@@ -93,7 +100,12 @@ shared `Warmup` settle time is folded into the first phase's duration.
 
 Each chart plots, on the left axis, the **AIMD rate estimate** (controlled variable), the **admitted** throughput
 (measured), and the **backend capacity** (the bottleneck being discovered, dashed); on the right axis the limiter's
-**observed failure ratio**. Vertical lines mark `worsening` / `recovering` / `recovered` control-loop events.
+**observed failure ratio**. A shaded band marks any stretch where the limiter ran on **slow-start** (the measurement
+window was starved of samples).
+
+The additive increase only runs while the limiter considers the backend healthy: once a band trips, probing is paused
+until the failure ratio fully clears, so a degraded sawtooth holds flat between cuts rather than ramping back up
+immediately.
 
 ### congestion-sawtooth
 Constant backend capacity below `maxRate`: AIMD oscillates around it in the classic TCP sawtooth — additive increase
@@ -131,6 +143,15 @@ Capacity steps down gradually; the limiter re-discovers a lower safe rate at eac
 A two-tier backend (soft + hard ceiling) produces two distinct failure levels across the hysteresis bands.
 
 ![graded-degradation](../docs/images/adaptive-rate-limiter/graded-degradation.png)
+
+### slow-start
+The offered load is held *below* the sampling floor, so no measurement window ever collects enough samples to report a
+failure ratio. With no signal to act on, the limiter would deadlock at a low rate (additive increase is paused while
+unhealthy) — so it instead runs TCP-style slow-start, blindly doubling the rate estimate each window until it reaches
+`maxRate`. Admitted throughput stays pinned at the offered load (demand-limited) while the estimate climbs; the shaded
+band marks the starved, slow-start regime. When full load returns the window fills and the estimate settles.
+
+![slow-start](../docs/images/adaptive-rate-limiter/slow-start.png)
 
 ## AdmissionController charts
 

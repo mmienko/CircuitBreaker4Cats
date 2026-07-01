@@ -30,20 +30,44 @@ def read_rows(path):
 
 
 def load_samples(path):
-    elapsed, aimd, admitted, capacity, observed = [], [], [], [], []
+    elapsed, aimd, admitted, capacity, observed, slow_start = [], [], [], [], [], []
     for row in read_rows(path):
         elapsed.append(float(row["elapsed_ms"]) / 1000.0)  # seconds
         aimd.append(float(row["aimd_rps"]))
         admitted.append(float(row["admitted_rps"]))
         capacity.append(float(row["backend_capacity_rps"]))
         observed.append(float(row["observed_failure_ratio"]))
-    return elapsed, aimd, admitted, capacity, observed
+        # Optional column: absent in older data, "1"/"0" otherwise.
+        slow_start.append(row.get("slow_start_active", "0") == "1")
+    return elapsed, aimd, admitted, capacity, observed, slow_start
+
+
+def slow_start_spans(elapsed, slow_start):
+    """Contiguous (start, end) time ranges where the limiter was in the slow-start (insufficient-data) regime."""
+    spans = []
+    start = None
+    for t, active in zip(elapsed, slow_start):
+        if active and start is None:
+            start = t
+        elif not active and start is not None:
+            spans.append((start, t))
+            start = None
+    if start is not None:
+        spans.append((start, elapsed[-1]))
+    return spans
 
 
 def render_scenario(entry, data_dir, out_dir):
-    elapsed, aimd, admitted, capacity, observed = load_samples(data_dir / entry["samples_file"])
+    elapsed, aimd, admitted, capacity, observed, slow_start = load_samples(data_dir / entry["samples_file"])
 
     fig, ax_rate = plt.subplots(figsize=(11, 5))
+
+    # Shade the spans where the measurement window was starved and the limiter ran blind on slow-start.
+    slow_start_handle = None
+    for start, end in slow_start_spans(elapsed, slow_start):
+        slow_start_handle = ax_rate.axvspan(
+            start, end, color="#f1c40f", alpha=0.15, label="slow-start (insufficient data)"
+        )
 
     # Left axis: rates (requests / second). The AIMD estimate is the controlled variable; the dashed line is the
     # backend's true capacity (the bottleneck the AIMD is discovering); admitted is the measured throughput.
@@ -70,6 +94,8 @@ def render_scenario(entry, data_dir, out_dir):
     ax_ratio.set_ylim(-0.02, 1.02)
 
     handles = [rate_line, admitted_line, capacity_line, observed_line]
+    if slow_start_handle is not None:
+        handles.append(slow_start_handle)
     # Legend in a single horizontal row above the plot so it never covers the curves.
     ax_rate.legend(
         handles=handles, loc="lower center", bbox_to_anchor=(0.5, 1.02), ncol=len(handles), frameon=False, fontsize=9

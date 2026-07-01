@@ -35,8 +35,10 @@ trait AdaptiveRateLimiter[F[_]] {
     */
   def rate: F[Rate]
 
-  /** Most recently sampled failure ratio in `[0, 1]`; `0.0` until the measurement window is initialized. */
-  def failureRatio: F[Double]
+  /** Most recently sampled failure ratio in `[0, 1]`; `None` until the measurement window holds enough samples to
+    * report one (a starved window, i.e. the controller's slow-start regime).
+    */
+  def failureRatio: F[Option[Double]]
 }
 
 object AdaptiveRateLimiter {
@@ -255,7 +257,7 @@ object AdaptiveRateLimiter {
 
       _ <- Spawn[F].background {
         failureRates
-          .evalTap(_.traverse_(adaptiveRateLimiter.setFailureRatio))
+          .evalTap(adaptiveRateLimiter.setFailureRatio)
           .through(failureRateCategorizer)
           .evalTap(_.traverse_(onFailureCategoryChange))
           .through(aimdRateController)
@@ -517,7 +519,7 @@ object AdaptiveRateLimiter {
       measurements: SampledMeasurements[F]
   ) extends AdaptiveRateLimiter[F] {
 
-    @volatile private var _failureRatio: Double = 0.0
+    @volatile private var _failureRatio: Option[Double] = None
 
     override def consume: F[Boolean] = rateLimiter.consume()
 
@@ -527,10 +529,10 @@ object AdaptiveRateLimiter {
 
     override def rate: F[Rate] = rateLimiter.refillRate
 
-    override def failureRatio: F[Double] = Sync[F].delay(_failureRatio)
+    override def failureRatio: F[Option[Double]] = Sync[F].delay(_failureRatio)
 
-    def setFailureRatio(newValue: Double): F[Unit] = Sync[F].delay {
-      _failureRatio = newValue
+    def setFailureRatio(failureRatio: Option[Double]): F[Unit] = Sync[F].delay {
+      _failureRatio = failureRatio
     }
   }
 }

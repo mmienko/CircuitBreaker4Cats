@@ -67,6 +67,22 @@ object Scenario {
   // A capacity comfortably above maxRate keeps the backend healthy (no overload), so the rate plateaus at max.
   private val Healthy: Rate = rps(500)
 
+  // Slow-start config: start the estimate far below maxRate and stretch the measurement cadence (50ms slots x 4 =
+  // 200ms window, sampled every 200ms) so the geometric doublings are legible. The starved lull offers fewer than
+  // NumberOfClients requests inside any window, so minNumberOfMeasurements above that count keeps every window
+  // insufficient and the limiter continuously in slow-start (a tiny additive step keeps doublings the visible driver).
+  // A small burst capacity keeps the resume transition from dumping a large burst that would overwhelm the backend.
+  private val SlowStartConfig: Config =
+    BaseConfig.copy(
+      capacity = 8,
+      initialRate = rps(20),
+      minRate = rps(20),
+      rateIncreaseBy = rps(2),
+      slotDuration = 50.millis,
+      measurementPeriod = 200.millis,
+      minNumberOfMeasurements = 16
+    )
+
   private val congestionSawtooth: Scenario =
     Scenario(
       name = "congestion-sawtooth",
@@ -170,6 +186,23 @@ object Scenario {
       )
     )
 
+  private val slowStart: Scenario =
+    Scenario(
+      name = "slow-start",
+      description =
+        "Offered load starved below the sampling floor: with no measurements the limiter blindly doubles the rate " +
+          "(TCP slow-start) until load returns and the window fills.",
+      config = SlowStartConfig,
+      // The backend stays healthy throughout; the story is the offered load, not the capacity. The lull offers 10 rps
+      // (below the 20 rps floor) so every window is starved and slow-start drives the estimate up to maxRate while the
+      // admitted throughput stays pinned at the offered load. Restoring full load fills the window and the estimate
+      // settles at maxRate.
+      phases = NonEmptyList.of(
+        Backend.Phase(hardCeiling = Healthy, softCeilings = Nil, duration = Warmup + 2.seconds, offeredLoad = rps(10)),
+        Backend.Phase(hardCeiling = Healthy, softCeilings = Nil, duration = 2.seconds)
+      )
+    )
+
   val all: List[Scenario] = List(
     congestionSawtooth,
     quickDegradation,
@@ -177,6 +210,7 @@ object Scenario {
     slowRecovery,
     flapping,
     slowDegradation,
-    gradedDegradation
+    gradedDegradation,
+    slowStart
   )
 }

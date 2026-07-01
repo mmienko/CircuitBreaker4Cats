@@ -6,3 +6,4 @@ slow-recovery,Capacity recovers in steps; the limiter climbs back to a higher sa
 flapping,Capacity flaps between healthy and degraded: compounding cuts ratchet the rate toward the floor.,flapping-samples.csv,flapping-events.csv
 slow-degradation,Capacity steps down gradually; the limiter re-discovers a lower safe rate at each step.,slow-degradation-samples.csv,slow-degradation-events.csv
 graded-degradation,A two-tier backend (soft + hard ceiling) produces two distinct failure levels across the bands.,graded-degradation-samples.csv,graded-degradation-events.csv
+slow-start,Offered load starved below the sampling floor: with no measurements the limiter blindly doubles the rate (TCP slow-start) until load returns and the window fills.,slow-start-samples.csv,slow-start-events.csv

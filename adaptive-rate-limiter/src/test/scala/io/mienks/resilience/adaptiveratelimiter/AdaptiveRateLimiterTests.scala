@@ -61,7 +61,7 @@ class AdaptiveRateLimiterTests extends CatsEffectSuite {
       for {
         _                  <- IO.sleep(MeasurementPeriod * 3)
         ratio              <- limiter.failureRatio
-        _                  <- IO(assertEquals(ratio, 0.0))
+        _                  <- IO(assertEquals(ratio, none[Double]))
         category           <- categoryChanges.tryTake
         _                  <- IO(assertEquals(category, none[FailureGradient]))
         lowestObservedRate <- minObservedRate.get
@@ -267,7 +267,7 @@ class AdaptiveRateLimiterTests extends CatsEffectSuite {
         _                  <- limiter.recordFailure.replicateA_(BaseConfig.minNumberOfMeasurements - 1)
         _                  <- IO.sleep(MeasurementWindow)
         ratio              <- limiter.failureRatio
-        _                  <- IO(assertEquals(ratio, 0.0))
+        _                  <- IO(assertEquals(ratio, none[Double]))
         category           <- categoryChanges.tryTake
         _                  <- IO(assertEquals(category, none[FailureGradient]))
         lowestObservedRate <- minObservedRate.get
@@ -280,11 +280,13 @@ class AdaptiveRateLimiterTests extends CatsEffectSuite {
     startLimiter().use { case LimiterWithEffects(limiter, _, _) =>
       startHittingBackend(limiter, initialFailureRatio = 0.0).use { ratioRef =>
         for {
-          _ <- poll(limiter.failureRatio.map(ratio => assert(ratio <= 0.05, clue = ratio)))
+          _ <- poll(limiter.failureRatio.map(ratio => assert(ratio.exists(_ <= 0.05), clue = ratio)))
           _ <- ratioRef.set(0.8)
-          _ <- poll(limiter.failureRatio.map(ratio => assert(math.abs(ratio - 0.8) <= 0.1, clue = ratio)))
+          _ <- poll(
+            limiter.failureRatio.map(ratio => assert(ratio.exists(r => math.abs(r - 0.8) <= 0.1), clue = ratio))
+          )
           _ <- ratioRef.set(0.0)
-          _ <- poll(limiter.failureRatio.map(ratio => assert(ratio <= 0.05, clue = ratio)))
+          _ <- poll(limiter.failureRatio.map(ratio => assert(ratio.exists(_ <= 0.05), clue = ratio)))
         } yield ()
       }
     }
