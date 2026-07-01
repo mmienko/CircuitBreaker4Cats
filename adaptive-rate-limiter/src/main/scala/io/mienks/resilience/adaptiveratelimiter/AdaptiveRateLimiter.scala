@@ -214,18 +214,23 @@ object AdaptiveRateLimiter {
     start[F](
       config = config,
       onFailureCategoryChange = (_: FailureGradient) => Async[F].unit,
-      onRateChange = (_: Rate) => Async[F].unit
+      onRateChange = (_: Rate) => Async[F].unit,
+      onError = (_: Throwable) => Async[F].unit
     )
 
   /** @param onFailureCategoryChange
     *   callback fired on each [[FailureGradient]] event (per band crossed on worsening or recovery)
     * @param onRateChange
     *   callback fired whenever the AIMD updates its estimated rate for the protected sink
+    * @param onError
+    *   callback fired when the AIMD control loop stream encounters an error; the stream restarts automatically after
+    *   invoking this callback
     */
   def start[F[_]: Async](
       config: Config,
       onFailureCategoryChange: FailureGradient => F[Unit],
-      onRateChange: Rate => F[Unit]
+      onRateChange: Rate => F[Unit],
+      onError: Throwable => F[Unit]
   ): Resource[F, AdaptiveRateLimiter[F]] =
     for {
       rateLimiter                  <- Resource.eval { RateLimiter.Dynamic[F](config = config.rateLimiterConfig) }
@@ -240,16 +245,18 @@ object AdaptiveRateLimiter {
 
       adaptiveRateLimiter = new DefaultAdaptiveRateLimiter[F](rateLimiter = rateLimiter, measurements = measurements)
 
+      stream = failureRates
+        .evalTap(adaptiveRateLimiter.setFailureRatio)
+        .through(failureRateCategorizer)
+        .evalTap(onFailureCategoryChange)
+        .through(aimdRateController)
+        .evalTap(onRateChange)
+        .evalMap(rateLimiter.setRefillRate)
+        .compile
+        .drain
+
       _ <- Spawn[F].background {
-        failureRates
-          .evalTap(adaptiveRateLimiter.setFailureRatio)
-          .through(failureRateCategorizer)
-          .evalTap(onFailureCategoryChange)
-          .through(aimdRateController)
-          .evalTap(onRateChange)
-          .evalMap(rateLimiter.setRefillRate)
-          .compile
-          .drain
+        stream.handleErrorWith(e => onError(e).attempt.void *> stream)
       }
     } yield adaptiveRateLimiter
 
@@ -449,7 +456,9 @@ object AdaptiveRateLimiter {
           case (rate, Right(_)) =>
             rate
           case (rate, Left(Tick)) =>
-            (rate + rateIncreaseBy.rate).min(maxRate)
+            Either
+              .catchOnly[IllegalArgumentException]((rate + rateIncreaseBy.rate).min(maxRate))
+              .getOrElse((rate.normalizedTo(rateIncreaseBy.rate.period) + rateIncreaseBy.rate).min(maxRate))
         }
         .changes
     }

@@ -289,6 +289,41 @@ class AimdRateControllerTests extends CatsEffectSuite {
     }
   }
 
+  test("additive increase does not overflow Int when rate has non-standard period from prior scaleBy") {
+    // Reproduces the load test crash. With rateDecreaseBy=0.7, each Worsening calls scaleBy(0.3) = ×(3/10).
+    // If requests×3 divides by 10, only requests shrinks (period stays 1s):
+    // Rate(10000,1s) → Rate(3000,1s) → Rate(900,1s) → Rate(270,1s) → Rate(81,1s)
+    // At Rate(81,1s): 81×3=243, and 243%10≠0 so inReducedForm kicks in. Since gcd(243, 10^10)=1
+    // (243=3^5 shares no factors with 10=2×5), the period must absorb the factor of 10:
+    // Rate(81,1s) → Rate(243,10s) → Rate(729,100s) → ... → Rate(59049, 10^6 s)
+    // After 10 decreases the rate is Rate(59049, 10^15 ns). 59049=3^10 is coprime with 10^15,
+    // so it can never reduce back to a shorter period. Each additive tick re-expresses 100 rps in
+    // this period (100 × 10^6 = 10^8 requests per 10^6 s), growing requests by ~100M per tick.
+    // At tick 22, requests hits 2_200_059_049 > Int.MaxValue and Rate.inReducedForm throws
+    // IllegalArgumentException, killing the AIMD background fiber.
+    TestControl.executeEmbed {
+      val config = AimdRateController.Config(
+        initialRate = Rate(requests = 10000, period = 1.second),
+        minRate = Rate(requests = 1, period = 10000.seconds),
+        maxRate = Rate(requests = 10000, period = 1.second),
+        rateIncreaseBy = AimdRateController.AimdRateIncrease(
+          rate = Rate(requests = 100, period = 1.second),
+          tickInterval = 1.second
+        ),
+        rateDecreaseBy = 0.7
+      )
+      // 10 Worsening signals each scale by 0.3: the rate drops to ~0.059 rps with a huge period.
+      // Recovery ticks then grow requests by ~100M each; tick 22 overflows without the fix.
+      // take=33: initial(1) + 10 decreases + 22 ticks (the 22nd is where the overflow occurs).
+      val signals = fs2.Stream.emits(List.fill(10)(FailedSignal)).covary[IO]
+      run(config = config, failureSignals = signals, take = 33).map { rates =>
+        assert(rates.length == 33)
+        assert(rates.forall(_ <= config.maxRate))
+        assert(rates.forall(_ >= config.minRate))
+      }
+    }
+  }
+
   private def run(
       config: AimdRateController.Config,
       failureSignals: fs2.Stream[IO, FailureGradient],

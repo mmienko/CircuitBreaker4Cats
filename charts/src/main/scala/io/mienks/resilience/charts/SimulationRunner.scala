@@ -33,7 +33,8 @@ object SimulationRunner {
           .start[IO](
             config = scenario.config,
             onFailureCategoryChange = (event: FailureGradient) => recorder.recordGradient(event),
-            onRateChange = (rate: Rate) => recorder.recordRate(toRps(rate))
+            onRateChange = (rate: Rate) => recorder.recordRate(toRps(rate)),
+            onError = (_: Throwable) => IO.unit
           )
 
         callBackend = limiter.protect(

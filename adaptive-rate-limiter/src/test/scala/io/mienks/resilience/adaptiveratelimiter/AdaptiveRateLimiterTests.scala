@@ -290,6 +290,35 @@ class AdaptiveRateLimiterTests extends CatsEffectSuite {
     }
   }
 
+  test("onError is invoked and the stream restarts when the control loop encounters an error") {
+    for {
+      errors    <- Ref[IO].of(List.empty[Throwable])
+      callCount <- Ref[IO].of(0)
+      _         <- AdaptiveRateLimiter
+        .start[IO](
+          config = BaseConfig,
+          onFailureCategoryChange = (_: FailureGradient) =>
+            callCount.updateAndGet(_ + 1).flatMap {
+              case 1 => IO.raiseError(new RuntimeException("boom"))
+              case _ => IO.unit
+            },
+          onRateChange = (_: Rate) => IO.unit,
+          onError = (e: Throwable) => errors.update(e :: _)
+        )
+        .use { limiter =>
+          startHittingBackend(limiter, initialFailureRatio = 0.8).use { ratioRef =>
+            for {
+              // Wait for the first category change to throw and trigger onError
+              _ <- poll(errors.get.map(es => assert(es.nonEmpty, clue = "onError was never called")))
+              // Switch to healthy traffic; the stream must still be running to observe recovery
+              _ <- ratioRef.set(0.0)
+              _ <- assertRateConverges(limiter, MaxRate)
+            } yield ()
+          }
+        }
+    } yield ()
+  }
+
   private def startLimiter(config: Config = BaseConfig): Resource[IO, LimiterWithEffects] =
     for {
       categoryChanges <- Resource.eval(Queue.unbounded[IO, FailureGradient])
@@ -297,7 +326,8 @@ class AdaptiveRateLimiterTests extends CatsEffectSuite {
       limiter         <- AdaptiveRateLimiter.start[IO](
         config = config,
         onFailureCategoryChange = (event: FailureGradient) => categoryChanges.offer(event),
-        onRateChange = (rate: Rate) => minObservedRate.update(current => if (rate < current) rate else current)
+        onRateChange = (rate: Rate) => minObservedRate.update(current => if (rate < current) rate else current),
+        onError = (_: Throwable) => IO.unit
       )
     } yield LimiterWithEffects(limiter = limiter, categoryChanges = categoryChanges, minObservedRate = minObservedRate)
 

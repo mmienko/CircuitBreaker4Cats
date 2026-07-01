@@ -81,6 +81,22 @@ final case class Rate(requests: Int, period: FiniteDuration) extends Ordered[Rat
     else Rate.inReducedForm(numerator = num, denominator = den, opName = "subtract")
   }
 
+  /** Re-express this rate in the given target period, truncating any sub-request remainder. For example,
+    * `Rate(59049, 1000000.seconds).normalizedTo(1.second)` yields `Rate(0, 1.second)` because the throughput is less
+    * than 1 request per second. This prevents period accumulation from inflating the `requests` field past
+    * `Int.MaxValue` during repeated additions.
+    */
+  def normalizedTo(targetPeriod: FiniteDuration): Rate = {
+    if (this.period == targetPeriod) this
+    else if (this.requests == 0) Rate(requests = 0, period = targetPeriod)
+    else {
+      val tp               = BigInt(targetPeriod.toNanos)
+      val requestsInTarget = (BigInt(this.requests) * tp) / BigInt(this.period.toNanos)
+      if (requestsInTarget.isValidInt) Rate(requests = requestsInTarget.toInt, period = targetPeriod)
+      else Rate.inReducedForm(numerator = requestsInTarget, denominator = tp, opName = "normalizedTo")
+    }
+  }
+
   /** Scale effective throughput: `factor == 1` leaves this unchanged; `factor < 1` slows the rate; `factor > 1` speeds
     * it up. `0` yields [[Rate.Zero]]; negative, NaN, or infinite `factor` throws.
     */
