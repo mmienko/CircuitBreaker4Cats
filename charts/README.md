@@ -153,6 +153,16 @@ band marks the starved, slow-start regime. When full load returns the window fil
 
 ![slow-start](../docs/images/adaptive-rate-limiter/slow-start.png)
 
+### slow-start-reentrance
+Slow-start is not just a start-up phase — it re-enters whenever the window is starved again. The run starts healthy at
+`maxRate`, then a degradation trips a band and cuts the rate once; because the limiter is now unhealthy, additive
+probing is paused and the rate holds flat (the flat bottom). Traffic then stops (offered load below the floor), so
+every window goes starved and slow-start re-enters, doubling the rate back up. Crucially it caps at `ssthresh` — the
+rate just before the cut — so it re-probes to the last known-good rate instead of blindly overshooting or staying
+stuck at the floor. The shaded bands mark the starved, slow-start regimes.
+
+![slow-start-reentrance](../docs/images/adaptive-rate-limiter/slow-start-reentrance.png)
+
 ## AdmissionController charts
 
 The [`admission-controller`](../admission-controller) charts tell a different story than the rate limiter. Instead of
