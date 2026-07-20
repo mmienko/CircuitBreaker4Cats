@@ -83,6 +83,12 @@ object Scenario {
       minNumberOfMeasurements = 16
     )
 
+  // Re-entrance config: same stretched cadence and starvation floor as SlowStartConfig, but the estimate starts at
+  // maxRate so the run opens on a healthy plateau. A degradation then cuts the rate and leaves the limiter unhealthy
+  // (additive probing paused); once traffic stops, slow-start is the only thing that can move the rate.
+  private val SlowStartReentranceConfig: Config =
+    SlowStartConfig.copy(initialRate = rps(400))
+
   private val congestionSawtooth: Scenario =
     Scenario(
       name = "congestion-sawtooth",
@@ -203,6 +209,25 @@ object Scenario {
       )
     )
 
+  private val slowStartReentrance: Scenario =
+    Scenario(
+      name = "slow-start-reentrance",
+      description =
+        "A degradation cuts the rate and pauses probing; then traffic stops, so slow-start re-enters and re-probes " +
+          "back up to the last good rate (ssthresh) instead of staying stuck at the floor.",
+      config = SlowStartReentranceConfig,
+      // Start healthy at maxRate. The mid phase degrades the backend enough to trip the first band once (a single cut
+      // to ~half rate) and hold the failure ratio inside that band, so the limiter stays unhealthy and additive
+      // probing is paused (a flat bottom). The final phase stops the traffic (offered load below the floor): every
+      // window starves, so slow-start re-enters and doubles the rate back up to ssthresh (the pre-degrade rate) where
+      // it caps, rather than blindly overshooting.
+      phases = NonEmptyList.of(
+        Backend.Phase(hardCeiling = Healthy, softCeilings = Nil, duration = Warmup + 1.second),
+        Backend.Phase(hardCeiling = rps(150), softCeilings = Nil, duration = 2.seconds),
+        Backend.Phase(hardCeiling = rps(150), softCeilings = Nil, duration = 2500.millis, offeredLoad = rps(10))
+      )
+    )
+
   val all: List[Scenario] = List(
     congestionSawtooth,
     quickDegradation,
@@ -211,6 +236,7 @@ object Scenario {
     flapping,
     slowDegradation,
     gradedDegradation,
-    slowStart
+    slowStart,
+    slowStartReentrance
   )
 }

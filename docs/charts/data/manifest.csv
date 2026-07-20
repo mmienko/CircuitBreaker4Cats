@@ -7,3 +7,4 @@ flapping,Capacity flaps between healthy and degraded: compounding cuts ratchet t
 slow-degradation,Capacity steps down gradually; the limiter re-discovers a lower safe rate at each step.,slow-degradation-samples.csv,slow-degradation-events.csv
 graded-degradation,A two-tier backend (soft + hard ceiling) produces two distinct failure levels across the bands.,graded-degradation-samples.csv,graded-degradation-events.csv
 slow-start,Offered load starved below the sampling floor: with no measurements the limiter blindly doubles the rate (TCP slow-start) until load returns and the window fills.,slow-start-samples.csv,slow-start-events.csv
+slow-start-reentrance,"A degradation cuts the rate and pauses probing; then traffic stops, so slow-start re-enters and re-probes back up to the last good rate (ssthresh) instead of staying stuck at the floor.",slow-start-reentrance-samples.csv,slow-start-reentrance-events.csv
