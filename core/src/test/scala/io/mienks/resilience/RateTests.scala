@@ -161,22 +161,27 @@ final class RateTests extends FunSuite {
     assertEquals(Ordering[RateReduction].compare(x = half, y = RateReduction.One), half.compare(RateReduction.One))
   }
 
-  test("repeated multiplicative decreases and additive increases cannot overflow the representation") {
-    val minRate  = Rate(requests = 1, period = 10_000.seconds)
-    val maxRate  = Rate(requests = 10_000, period = 1.second)
-    val increase = Rate(requests = 100, period = 1.second)
-    val decrease = RateReduction(value = 0.3)
+  test("repeated rounds of multiplicative decreases and additive increases cannot overflow the representation") {
+    val minRate             = Rate(requests = 1, period = 10_000.seconds)
+    val maxRate             = Rate(requests = 10_000, period = 1.second)
+    val increase            = Rate(requests = 100, period = 1.second)
+    val decrease            = RateReduction(value = 0.3)
+    val numberOfRounds      = 5
+    val decreasesPerRound   = 10
+    val increasesPerRound   = 22
+    val transitionsPerRound = decreasesPerRound + increasesPerRound
 
-    val decreasedRates = List.fill(10)(()).scanLeft(maxRate) { case (rate, _) =>
-      rate.reduceBy(factor = decrease).max(minRate)
+    val allRates = List.fill(numberOfRounds)(()).foldLeft(List(maxRate)) { case (rates, _) =>
+      val decreasedRates = List.fill(decreasesPerRound)(()).scanLeft(rates.last) { case (rate, _) =>
+        rate.reduceBy(factor = decrease).max(minRate)
+      }
+      val recoveredRates = List.fill(increasesPerRound)(()).scanLeft(decreasedRates.last) { case (rate, _) =>
+        (rate + increase).min(maxRate)
+      }
+      rates ++ decreasedRates.tail ++ recoveredRates.tail
     }
-    val recoveredRates = List.fill(22)(()).scanLeft(decreasedRates.last) { case (rate, _) =>
-      (rate + increase).min(maxRate)
-    }
-    val allRates = decreasedRates ++ recoveredRates
 
-    assertEquals(decreasedRates.length, 11)
-    assertEquals(recoveredRates.length, 23)
+    assertEquals(allRates.length, 1 + numberOfRounds * transitionsPerRound)
     assert(allRates.forall(rate => rate >= minRate && rate <= maxRate))
   }
 }
