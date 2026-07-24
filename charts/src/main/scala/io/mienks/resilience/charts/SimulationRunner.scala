@@ -66,7 +66,7 @@ object SimulationRunner {
     } yield result
 
   private def toRps(rate: Rate): Double =
-    rate.requests.toDouble / rate.period.toUnit(TimeUnit.SECONDS)
+    rate.eventsPer(unit = TimeUnit.SECONDS)
 
   /** Mutable, in-flight recording for a single run: the sampled timeseries, the discrete control-loop events, and the
     * admitted-request counter used to derive throughput.
