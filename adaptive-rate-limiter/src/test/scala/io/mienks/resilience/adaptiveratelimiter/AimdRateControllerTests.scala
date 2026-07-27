@@ -333,6 +333,47 @@ class AimdRateControllerTests extends CatsEffectSuite {
     }
   }
 
+  test("slow start caps at the pre-degrade rate across consecutive Worsening events") {
+    TestControl.executeEmbed {
+      runSignals(
+        config = AimdRateController.Config(
+          initialRate = Rate(requests = 32, period = 1.second),
+          minRate = Rate(requests = 1, period = 1.second),
+          maxRate = Rate(requests = 64, period = 1.second),
+          rateIncreaseBy =
+            AimdRateController.AimdRateIncrease(rate = Rate(requests = 1, period = 1.second), tickInterval = 1.hour),
+          rateDecreaseBy = 0.5,
+          insufficientDataRateGrowthFactor = 2.0
+        ),
+        // Two Worsening events in a row (one per band crossed) before any recovery: ssthresh must stay at the
+        // pre-degrade rate (32), not shrink to the intermediate 16 that the second decrease started from.
+        signals = fs2.Stream
+          .emits(
+            List(
+              Worsening(toLevel = 0).some,
+              Worsening(toLevel = 1).some,
+              none[FailureGradient],
+              none[FailureGradient],
+              none[FailureGradient]
+            )
+          )
+          .covary[IO],
+        take = 5
+      ).map(
+        assertRatesEquivalent(
+          _,
+          List(
+            Rate(requests = 32, period = 1.second), // initial
+            Rate(requests = 16, period = 1.second), // Worsening(0): halve; ssthresh captured at 32 (pre-degrade)
+            Rate(requests = 8, period = 1.second),  // Worsening(1): halve again; ssthresh must remain 32, not 16
+            Rate(requests = 16, period = 1.second), // slow start doubles 8 -> 16
+            Rate(requests = 32, period = 1.second)  // slow start doubles 16 -> 32 and caps at ssthresh (32), below max
+          )
+        )
+      )
+    }
+  }
+
   test("slow start rounds fractional fixed-point growth up") {
     TestControl.executeEmbed {
       runSignals(

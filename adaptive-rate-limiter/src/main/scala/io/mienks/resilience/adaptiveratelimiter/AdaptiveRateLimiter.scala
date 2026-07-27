@@ -35,8 +35,7 @@ trait AdaptiveRateLimiter[F[_]] {
     */
   def rate: F[Rate]
 
-  /** Most recently sampled failure ratio in `[0, 1]`; `None` until the measurement window holds enough samples to
-    * report one (a starved window, i.e. the controller's slow-start regime).
+  /** Most recently sampled failure ratio in `[0, 1]`; `None` until the measurement window holds enough samples.
     */
   def failureRatio: F[Option[Double]]
 }
@@ -510,7 +509,7 @@ object AdaptiveRateLimiter {
             state.copy(
               rate = state.rate.reduceBy(factor = multiplicativeDecrease).max(minRate),
               // memorize last known good rate to avoid overshooting
-              insufficientDataThreshold = state.rate,
+              insufficientDataThreshold = if (state.healthy) state.rate else state.insufficientDataThreshold,
               healthy = false
             )
           case (state, Right(Some(FailureGradient.Recovered))) =>
