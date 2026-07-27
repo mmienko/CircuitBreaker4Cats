@@ -521,10 +521,7 @@ object AdaptiveRateLimiter {
           case (state, Right(None)) =>
             // Slow Start (not enough samples): Discover the rate. Avoid overshooting by capping at last known rate which produced samples.
             state.copy(rate =
-              state.rate
-                .multiplyBy(factor = slowStartGrowthFactor)
-                .min(state.insufficientDataThreshold)
-                .min(maxRate)
+              state.rate.multiplyBy(factor = slowStartGrowthFactor).min(state.insufficientDataThreshold)
             )
           case (state, Left(Tick)) =>
             // Additive Increase: Grow the rate
