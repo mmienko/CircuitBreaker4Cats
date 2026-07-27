@@ -153,22 +153,39 @@ object AdaptiveRateLimiter {
 
     /** Convenience builder for RPS-shaped configurations. Capacity is set to `maxRps`, the bucket window covers
       * `timeRangeForMeasurementInSeconds` one-second slots, and `minNumberOfMeasurements` equals the slot count.
+      * @see
+      *   [[Config]] for full parameter descriptions.
+      * @param minRps
+      *   minimum rate in requests per second
+      * @param maxRps
+      *   starting rate and maximum rate, in requests per second
+      * @param rpsIncrease
+      *   the rps to add on each additive increase tick (see rateIncreasePeriod)
+      * @param rpsDecrease
+      *   percentage to reduce the current rate on each multiplicative decrease
+      * @param timeRangeForMeasurementInSeconds
+      *   measurement window
+      * @param failureLevels
+      *   failure ratios to trigger AIMD multiplicative decrease; ordered least- to most-severe
+      * @param rateIncreasePeriod
+      *   interval at which the rate is increased
       */
     def fromRps(
         minRps: Int,
         maxRps: Int,
-        rpsIncreaseRate: Rate,
+        rpsIncrease: Int,
         rpsDecrease: Double,
         timeRangeForMeasurementInSeconds: Int,
-        failureLevels: NonEmptyList[HysteresisBand]
+        failureLevels: NonEmptyList[HysteresisBand],
+        rateIncreasePeriod: FiniteDuration = 1.second
     ): Config =
       Config(
         capacity = maxRps,
         initialRate = Rate(requests = maxRps, period = 1.second),
         minRate = Rate(requests = minRps, period = 1.second),
         maxRate = Rate(requests = maxRps, period = 1.second),
-        rateIncreaseBy = rpsIncreaseRate,
-        rateIncreasePeriod = 1.second,
+        rateIncreaseBy = Rate(requests = rpsIncrease, period = 1.second),
+        rateIncreasePeriod = rateIncreasePeriod,
         rateDecreaseBy = rpsDecrease,
         numberOfSlotsForMeasurements = timeRangeForMeasurementInSeconds,
         slotDuration = 1.second,

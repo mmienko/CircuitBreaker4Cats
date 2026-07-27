@@ -44,9 +44,11 @@ final class Rate private (val perDay: Long) extends AnyVal with Ordered[Rate] {
   def max(that: Rate): Rate =
     if (this >= that) this else that
 
-  def +(that: Rate): Rate =
-    if (perDay >= Rate.MaxPerDay - that.perDay) Rate.Max
-    else new Rate(perDay = perDay + that.perDay)
+  def +(that: Rate): Rate = {
+    val newRate = perDay + that.perDay
+    if (newRate >= Rate.MaxPerDay) Rate.Max
+    else new Rate(perDay = newRate)
+  }
 
   /** Reduces this rate by a fixed-point factor, rounding up to the next event per day. */
   def reduceBy(factor: RateReduction): Rate =
@@ -86,7 +88,7 @@ object Rate {
     else new Rate(perDay = perDay.toLong)
   }
 
-  /** Total throughput order; [[cats.kernel.Eq]] comes from [[Order]]. */
+  /** Total ordering; [[cats.kernel.Eq]] is derived from [[Order]]. */
   implicit val catsKernelOrderForRate: Order[Rate] =
     Order.from[Rate]((x, y) => x.compare(y))
 

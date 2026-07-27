@@ -16,11 +16,11 @@ object RateReduction {
 
   val One: RateReduction = new RateReduction(numerator = Denominator)
 
-  /** Approximates a reduction or identity factor with 20 fractional bits, rounding to the nearest value. */
+  /** Approximates a number in the range `(0, 1]` with 20 fractional bits, rounding to the nearest value. */
   def apply(value: Double): RateReduction =
     from(value).fold(errMsg => throw new IllegalArgumentException(errMsg), identity)
 
-  /** Approximates a reduction or identity factor with 20 fractional bits, rounding to the nearest value. */
+  /** Approximates a number in the range `(0, 1]` with 20 fractional bits, rounding to the nearest value. */
   def from(value: Double): Either[String, RateReduction] =
     for {
       _ <- Either.cond(
