@@ -91,7 +91,7 @@ object RateLimiter {
           (),
           new IllegalArgumentException(s"initialCapacity must be non-negative, got: $initialCapacity") with NoStackTrace
         )
-        emissionIntervalNanos <- refillRate.validate
+        emissionIntervalNanos = refillRate.emissionIntervalNanos
         _ <- Config.requireNoOverflow(emissionIntervalNanos, capacity.toLong, "emissionInterval * capacity")
         _ <- Config.requireNoOverflow(
           emissionIntervalNanos,

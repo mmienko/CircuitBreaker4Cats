@@ -42,14 +42,6 @@ class ConfigTests extends FunSuite {
     assert(result.left.exists(_.getMessage.contains("initialCapacity must be non-negative")))
   }
 
-  test("validate rejects invalid refillRate") {
-    val result =
-      Config(capacity = 5, initialCapacity = 0, refillRate = RefillRate(requests = 0, period = 1.second)).validate
-    assert(result.isLeft)
-    assert(result.left.exists(_.isInstanceOf[IllegalArgumentException]))
-    assert(result.left.exists(_.getMessage.contains("rate.requests must be positive")))
-  }
-
   test("validate rejects config that would overflow emissionInterval * capacity") {
     val result = Config(
       capacity = Int.MaxValue,

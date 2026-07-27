@@ -6,7 +6,7 @@ import cats.syntax.all._
 import cats.{Applicative, ApplicativeThrow, Monad}
 import fs2.{Chunk, Pipe}
 import io.mienks.resilience.ratelimiter.{DynamicRateLimiter, RateLimiter}
-import io.mienks.resilience.{Measurements, Rate, SampledMeasurements}
+import io.mienks.resilience.{Measurements, Rate, RateReduction, SampledMeasurements}
 
 import scala.concurrent.duration._
 
@@ -153,22 +153,39 @@ object AdaptiveRateLimiter {
 
     /** Convenience builder for RPS-shaped configurations. Capacity is set to `maxRps`, the bucket window covers
       * `timeRangeForMeasurementInSeconds` one-second slots, and `minNumberOfMeasurements` equals the slot count.
+      * @see
+      *   [[Config]] for full parameter descriptions.
+      * @param minRps
+      *   minimum rate in requests per second
+      * @param maxRps
+      *   starting rate and maximum rate, in requests per second
+      * @param rpsIncrease
+      *   the rps to add on each additive increase tick (see rateIncreasePeriod)
+      * @param rpsDecrease
+      *   percentage to reduce the current rate on each multiplicative decrease
+      * @param timeRangeForMeasurementInSeconds
+      *   measurement window
+      * @param failureLevels
+      *   failure ratios to trigger AIMD multiplicative decrease; ordered least- to most-severe
+      * @param rateIncreasePeriod
+      *   interval at which the rate is increased
       */
     def fromRps(
         minRps: Int,
         maxRps: Int,
-        rpsIncreaseRate: Rate,
+        rpsIncrease: Int,
         rpsDecrease: Double,
         timeRangeForMeasurementInSeconds: Int,
-        failureLevels: NonEmptyList[HysteresisBand]
+        failureLevels: NonEmptyList[HysteresisBand],
+        rateIncreasePeriod: FiniteDuration = 1.second
     ): Config =
       Config(
         capacity = maxRps,
         initialRate = Rate(requests = maxRps, period = 1.second),
         minRate = Rate(requests = minRps, period = 1.second),
         maxRate = Rate(requests = maxRps, period = 1.second),
-        rateIncreaseBy = rpsIncreaseRate,
-        rateIncreasePeriod = rpsIncreaseRate.period,
+        rateIncreaseBy = Rate(requests = rpsIncrease, period = 1.second),
+        rateIncreasePeriod = rateIncreasePeriod,
         rateDecreaseBy = rpsDecrease,
         numberOfSlotsForMeasurements = timeRangeForMeasurementInSeconds,
         slotDuration = 1.second,
@@ -411,21 +428,16 @@ object AdaptiveRateLimiter {
         .fromEither {
           import config._
           (for {
-            _ <- check(initialRate =!= Rate.Zero, "initialRate must be nonzero")
-            _ <- check(minRate =!= Rate.Zero, "minRate must be nonzero")
-            _ <- check(maxRate =!= Rate.Zero, "maxRate must be nonzero")
-            _ <- check(rateIncreaseBy.rate =!= Rate.Zero, "rateIncreaseBy.rate must be nonzero")
-            _ <- rateIncreaseBy.rate.validate.leftMap(_.getMessage)
             _ <- check(rateIncreaseBy.tickInterval > Duration.Zero, "rateIncreaseBy.tickInterval > 0ms")
             _ <- check(minRate <= initialRate && initialRate <= maxRate, "min rate <= initial rate <= max rate")
-            _ <- check(rateDecreaseBy >= 0.0 && rateDecreaseBy <= 1.0, "0 <= rateDecreaseBy <= 1")
-          } yield ())
+            _ <- check(rateDecreaseBy >= 0.0 && rateDecreaseBy < 1.0, "0 <= rateDecreaseBy < 1")
+            multiplicativeDecrease <- RateReduction
+              .from(1.0 - rateDecreaseBy)
+              .leftMap(errMsg => s"failed to convert rateDecreaseBy to fixed point: $errMsg")
+          } yield multiplicativeDecrease)
             .leftMap(new IllegalArgumentException(_))
         }
-        .as {
-          val multiplicativeDecrease =
-            (BigDecimal.valueOf(1.0) - BigDecimal.valueOf(config.rateDecreaseBy)).toDouble
-
+        .map { multiplicativeDecrease =>
           aimdRateController[F](
             initialRate = config.initialRate,
             minRate = config.minRate,
@@ -440,7 +452,7 @@ object AdaptiveRateLimiter {
         minRate: Rate,
         maxRate: Rate,
         rateIncreaseBy: AimdRateIncrease,
-        multiplicativeDecrease: Double
+        multiplicativeDecrease: RateReduction
     ): Pipe[F, FailureGradient, Rate] = { failureSignals =>
       val ticks =
         fs2.Stream
@@ -452,13 +464,11 @@ object AdaptiveRateLimiter {
         .merge(ticks)
         .scan(initialRate) {
           case (rate, Right(FailureGradient.Worsening(_))) =>
-            rate.scaleBy(multiplicativeDecrease).max(minRate)
+            rate.reduceBy(multiplicativeDecrease).max(minRate)
           case (rate, Right(_)) =>
             rate
           case (rate, Left(Tick)) =>
-            Either
-              .catchOnly[IllegalArgumentException]((rate + rateIncreaseBy.rate).min(maxRate))
-              .getOrElse((rate.normalizedTo(rateIncreaseBy.rate.period) + rateIncreaseBy.rate).min(maxRate))
+            (rate + rateIncreaseBy.rate).min(maxRate)
         }
         .changes
     }

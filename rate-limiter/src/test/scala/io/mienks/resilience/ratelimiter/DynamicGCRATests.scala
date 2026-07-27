@@ -47,14 +47,6 @@ class DynamicGCRATests extends RateLimiterTests {
     } yield ()
   }
 
-  test("setRefillRate validates positive rate") {
-    for {
-      rl <- DynamicGCRA.full[IO](capacity = 5, RefillRate(1, 1.second))
-      _  <- interceptIO[IllegalArgumentException](rl.setRefillRate(RefillRate(requests = 0, period = 1.second)))
-      _  <- interceptIO[IllegalArgumentException](rl.setRefillRate(RefillRate(requests = -1, 1.second)))
-    } yield ()
-  }
-
   test("setRefillRate rejects rate that overflows emission * capacity") {
     for {
       rl <- DynamicGCRA.full[IO](capacity = Int.MaxValue, RefillRate(1, 1.second))

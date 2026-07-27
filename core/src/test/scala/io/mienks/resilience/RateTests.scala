@@ -1,45 +1,65 @@
 package io.mienks.resilience
 
-import cats.kernel.{Monoid, Order}
+import cats.kernel.{Order, Semigroup}
 import cats.syntax.eq._
 import cats.syntax.option._
 import cats.syntax.semigroup._
 import io.mienks.resilience.Rate.syntax._
 import munit.FunSuite
 
+import java.util.concurrent.TimeUnit
 import scala.concurrent.duration._
 
 final class RateTests extends FunSuite {
 
-  test("Eq matches throughput") {
+  test("construction canonicalizes equivalent rates to events per day") {
     assert(Rate(1, 1.second) === Rate(60, 1.minute))
     assert(Rate(1, 1.second) =!= Rate(2, 1.second))
-
     assert(Rate(requests = 1, period = 30.seconds) === Rate(requests = 2, period = 1.minute))
+    assertEquals(Rate(requests = 1, period = 1.second).perDay, 86_400L)
   }
 
-  test("Monoid empty is zero; combine sums effective rates") {
+  test("construction floors fractional events per day and clamps positive rates to bounds") {
+    assertEquals(Rate(requests = 1, period = 7.seconds).perDay, 12_342L)
+    assertEquals(Rate(requests = 1, period = 2.days), Rate.Min)
+    assertEquals(Rate(requests = 100, period = 1.millisecond), Rate.Max)
+    assertEquals(Rate(requests = 101, period = 1.millisecond), Rate.Max)
+    assertEquals(Rate(perDay = Long.MaxValue), Rate.Max)
+  }
+
+  test("construction rejects non-positive values") {
+    intercept[IllegalArgumentException](Rate(perDay = 0L))
+    intercept[IllegalArgumentException](Rate(perDay = -1L))
+    intercept[IllegalArgumentException](Rate(requests = 0, period = 1.second))
+    intercept[IllegalArgumentException](Rate(requests = -1, period = 1.second))
+    intercept[IllegalArgumentException](Rate(requests = 1, period = Duration.Zero))
+    intercept[IllegalArgumentException](Rate(requests = 1, period = (-1).second))
+  }
+
+  test("Semigroup combines rates and saturates at Max") {
     val onePerSecond = Rate(1, 1.second)
-    assert(Monoid[Rate].empty === Rate.Zero)
-    assert((Rate.Zero |+| onePerSecond) === onePerSecond)
-    assert((onePerSecond |+| Rate.Zero) === onePerSecond)
+
     assert((onePerSecond |+| onePerSecond) === Rate(2, 1.second))
     assert((onePerSecond |+| onePerSecond) === 2.per(1.second))
     assertEquals(60.per(1.minute) |+| onePerSecond, 120.per(1.minute))
     assertEquals(onePerSecond |+| 60.per(1.minute), 2.per(1.second))
-    assertEquals(Int.MaxValue.per(1.second) |+| Int.MaxValue.per(1.second), Int.MaxValue.per(500.millis))
+    assertEquals(Semigroup[Rate].combine(Rate.Max, onePerSecond), Rate.Max)
+    assertEquals(Rate(perDay = Rate.Max.perDay - 1L) + Rate.Min, Rate.Max)
   }
 
-  test("Monoid combine is associative") {
-    val a = Rate(1, 1.second)
-    val b = Rate(2, 1.second)
-    val c = Rate(1, 2.seconds)
+  test("saturating addition is associative") {
+    val a = Rate(requests = 1, period = 1.second)
+    val b = Rate(requests = 2, period = 1.second)
+    val c = Rate(requests = 1, period = 2.seconds)
+
     assert(((a |+| b) |+| c) === (a |+| (b |+| c)))
+    assert(((Rate.Max |+| b) |+| c) === (Rate.Max |+| (b |+| c)))
   }
 
   test("parse accepts valid rates and rejects invalid rates") {
     assertEquals(Rate.parse("8 requests / 2 minutes"), Rate(8, 2.minutes).some)
     assertEquals(Rate.parse("500 requests / 4 hours"), Rate(500, 4.hours).some)
+    assertEquals(Rate.parse("0 requests / 4 hours"), none[Rate])
     assertEquals(Rate.parse("abc requests / 4 hours"), none[Rate])
     assertEquals(Rate.parse("500 requests / xyz hours"), none[Rate])
   }
@@ -68,6 +88,7 @@ final class RateTests extends FunSuite {
     assert(onePerSecond < twoPerSecond)
     assert(twoPerSecond.compare(onePerSecond) > 0)
     assertEquals(Order[Rate].compare(x = onePerSecond, y = twoPerSecond), onePerSecond.compare(twoPerSecond))
+    assertEquals(Ordering[Rate].compare(x = onePerSecond, y = twoPerSecond), onePerSecond.compare(twoPerSecond))
   }
 
   test("min and max compare by effective throughput") {
@@ -84,76 +105,83 @@ final class RateTests extends FunSuite {
     assertEquals(sixtyPerMinute.max(that = onePerSecond), sixtyPerMinute)
   }
 
-  test("subtract clamps to zeroThroughput when subtrahend is larger or equal") {
-    val twoPerSecond = 2.per(1.second)
-    val onePerSecond = 1.per(1.second)
-    assert((twoPerSecond subtract onePerSecond) === onePerSecond)
-    assert((onePerSecond subtract twoPerSecond) === Rate.Zero)
-    assert((onePerSecond subtract onePerSecond) === Rate.Zero)
+  test("eventsPer converts the canonical rate to a TimeUnit") {
+    val rate = Rate(requests = 2, period = 1.second)
+
+    assertEquals(rate.eventsPer(unit = TimeUnit.NANOSECONDS), 2.0 / 1.second.toNanos.toDouble)
+    assertEquals(rate.eventsPer(unit = TimeUnit.MILLISECONDS), 0.002)
+    assertEquals(rate.eventsPer(unit = TimeUnit.SECONDS), 2.0)
+    assertEquals(rate.eventsPer(unit = TimeUnit.MINUTES), 120.0)
+    assertEquals(rate.eventsPer(unit = TimeUnit.HOURS), 7200.0)
+    assertEquals(rate.eventsPer(unit = TimeUnit.DAYS), 172_800.0)
+
+    assertEquals(rate.perNanosecond, rate.eventsPer(unit = TimeUnit.NANOSECONDS))
+    assertEquals(rate.perMicrosecond, rate.eventsPer(unit = TimeUnit.MICROSECONDS))
+    assertEquals(rate.perMillisecond, rate.eventsPer(unit = TimeUnit.MILLISECONDS))
+    assertEquals(rate.perSecond, rate.eventsPer(unit = TimeUnit.SECONDS))
+    assertEquals(rate.perMinute, rate.eventsPer(unit = TimeUnit.MINUTES))
+    assertEquals(rate.perHour, rate.eventsPer(unit = TimeUnit.HOURS))
   }
 
-  test("subtract works across periods; subtracting zeroThroughput is identity") {
-    val onePerSecond = 1.per(1.second)
-    val onePerTwoSec = 1.per(2.seconds)
-    assert((onePerSecond subtract onePerTwoSec) === onePerTwoSec)
-    assert((onePerSecond subtract Rate.Zero) === onePerSecond)
+  test("emissionIntervalNanos uses ceiling division") {
+    assertEquals(Rate(requests = 1, period = 1.second).emissionIntervalNanos, 1.second.toNanos)
+    assertEquals(Rate(requests = 2, period = 1.second).emissionIntervalNanos, 500.millis.toNanos)
+    assertEquals(Rate(perDay = 7L).emissionIntervalNanos, 12_342_857_142_858L)
+    assertEquals(Rate.Max.emissionIntervalNanos, 10_000L)
   }
 
-  test("validate accepts positive emission interval") {
-    assertEquals(Rate(1, 1.second).validate, Right(1.second.toNanos))
-    assertEquals(Rate(2, 1.second).validate, Right(500_000_000L))
-  }
-
-  test("validate rejects non-positive requests") {
-    val zeroRequests     = Rate(requests = 0, period = 1.second).validate
-    val negativeRequests = Rate(requests = -1, period = 1.second).validate
-
-    assert(zeroRequests.isLeft)
-    assert(zeroRequests.left.exists(_.isInstanceOf[IllegalArgumentException]))
-    assert(zeroRequests.left.exists(_.getMessage.contains("rate.requests must be positive")))
-    assert(negativeRequests.isLeft)
-    assert(negativeRequests.left.exists(_.getMessage.contains("rate.requests must be positive")))
-  }
-
-  test("validate rejects non-positive periods") {
-    val zeroPeriod     = Rate(requests = 1, period = 0.seconds).validate
-    val negativePeriod = Rate(requests = 1, period = (-1).second).validate
-
-    assert(zeroPeriod.isLeft)
-    assert(zeroPeriod.left.exists(_.getMessage.contains("rate.period must be positive")))
-    assert(negativePeriod.isLeft)
-    assert(negativePeriod.left.exists(_.getMessage.contains("rate.period must be positive")))
-  }
-
-  test("validate rejects zero emission interval") {
-    val result = Rate(requests = 2, period = 1.nanosecond).validate
-
-    assert(result.isLeft)
-    assert(result.left.exists(_.getMessage.contains("emission interval must be positive")))
-  }
-
-  test("scaleBy: 1 unchanged; below 1 slows; above 1 speeds; zero and invalid factors") {
+  test("reduceBy rounds reductions up and preserves bounds") {
     val fivePerSecond = 5.per(1.second) // 1 / 200 ms
-    assert(fivePerSecond.scaleBy(factor = 1.0) === fivePerSecond)
-    assert(fivePerSecond.scaleBy(factor = 0.5) === Rate(1, 400.millis))
-    assert(fivePerSecond.scaleBy(factor = 2.0) === 10.per(1.second))
-    assert(fivePerSecond.scaleBy(factor = 0.0) === 0.per(1.second))
 
-    assert(10.per(1.second).scaleBy(factor = 0.5) === 5.per(1.second))
-    assertEquals(10.per(1.second).scaleBy(factor = 0.5), 5.per(1.second))
-    assert(1.per(1.second).scaleBy(factor = 0.2) === Rate(1, 5.seconds))
-    assertEquals(1.per(30.seconds).scaleBy(factor = 0.5), 1.per(1.minute))
+    assertEquals(fivePerSecond.reduceBy(factor = RateReduction.One), fivePerSecond)
+    assertEquals(fivePerSecond.reduceBy(factor = RateReduction(value = 0.5)), Rate(1, 400.millis))
+    assertEquals(1.per(1.second).reduceBy(factor = RateReduction(value = 0.2)), Rate(1, 5.seconds))
+    assertEquals(1.per(30.seconds).reduceBy(factor = RateReduction(value = 0.5)), 1.per(1.minute))
+    assertEquals(Rate.Min.reduceBy(factor = RateReduction(value = 0.5)), Rate.Min)
+    assertEquals(
+      Rate.Max.reduceBy(factor = RateReduction(value = 0.5)),
+      Rate(perDay = Rate.Max.perDay / 2L)
+    )
+  }
 
-    assert(1.per(1.second).scaleBy(factor = 0.0) === Rate.Zero)
-    assert(Rate.Zero.scaleBy(factor = 3.0) === Rate.Zero)
-    assert(Rate.Zero.scaleBy(factor = 0.0) === Rate.Zero)
+  test("RateReduction rejects invalid or unrepresentable values") {
+    assert(RateReduction.from(value = 0.0).isLeft)
+    assert(RateReduction.from(value = -0.1).isLeft)
+    assert(RateReduction.from(value = 1.1).isLeft)
+    assert(RateReduction.from(value = Double.NaN).isLeft)
+    assert(RateReduction.from(value = Double.PositiveInfinity).isLeft)
+    assert(RateReduction.from(value = Double.MinPositiveValue).isLeft)
+  }
 
-    assert(1.per(1.nanosecond).scaleBy(factor = 10.0) === 10.per(1.nanosecond))
-    assert(1.per(3.nanoseconds).scaleBy(factor = 2.0) === 2.per(3.nanoseconds))
-    assertEquals(1.per(3.nanoseconds).scaleBy(factor = 2.0), 2.per(3.nanoseconds))
-    assertEquals(Int.MaxValue.per(1.second).scaleBy(factor = 2.0), Int.MaxValue.per(500.millis))
+  test("RateReduction supports total ordering") {
+    val half = RateReduction(value = 0.5)
 
-    intercept[IllegalArgumentException](1.per(1.second).scaleBy(factor = -0.1))
-    intercept[IllegalArgumentException](1.per(1.second).scaleBy(factor = Double.NaN))
+    assert(half < RateReduction.One)
+    assertEquals(Order[RateReduction].compare(x = half, y = RateReduction.One), half.compare(RateReduction.One))
+    assertEquals(Ordering[RateReduction].compare(x = half, y = RateReduction.One), half.compare(RateReduction.One))
+  }
+
+  test("repeated rounds of multiplicative decreases and additive increases cannot overflow the representation") {
+    val minRate             = Rate(requests = 1, period = 10_000.seconds)
+    val maxRate             = Rate(requests = 10_000, period = 1.second)
+    val increase            = Rate(requests = 100, period = 1.second)
+    val decrease            = RateReduction(value = 0.3)
+    val numberOfRounds      = 5
+    val decreasesPerRound   = 10
+    val increasesPerRound   = 22
+    val transitionsPerRound = decreasesPerRound + increasesPerRound
+
+    val allRates = List.fill(numberOfRounds)(()).foldLeft(List(maxRate)) { case (rates, _) =>
+      val decreasedRates = List.fill(decreasesPerRound)(()).scanLeft(rates.last) { case (rate, _) =>
+        rate.reduceBy(factor = decrease).max(minRate)
+      }
+      val recoveredRates = List.fill(increasesPerRound)(()).scanLeft(decreasedRates.last) { case (rate, _) =>
+        (rate + increase).min(maxRate)
+      }
+      rates ++ decreasedRates.tail ++ recoveredRates.tail
+    }
+
+    assertEquals(allRates.length, 1 + numberOfRounds * transitionsPerRound)
+    assert(allRates.forall(rate => rate >= minRate && rate <= maxRate))
   }
 }

@@ -1,5 +1,6 @@
 package io.mienks.resilience.ratelimiter
 
+import java.util.concurrent.TimeUnit
 import scala.concurrent.duration.FiniteDuration
 import cats.effect.std.AtomicCell
 import cats.effect.{Async, Clock, Ref}
@@ -26,7 +27,7 @@ class TokenBucket[F[_]: Monad: Clock] private (
     tokens: Ref[F, Double]
 ) extends RateLimiter[F] {
 
-  private val tokensPerNanosecond: Double = configuredRefillRate.requests.toDouble / configuredRefillRate.period.toNanos
+  private val tokensPerNanosecond: Double = configuredRefillRate.eventsPer(unit = TimeUnit.NANOSECONDS)
 
   def capacity: F[Int] = Applicative[F].pure(bucketCapacity.toInt)
 

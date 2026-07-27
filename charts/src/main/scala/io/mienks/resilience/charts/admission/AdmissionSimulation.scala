@@ -62,7 +62,7 @@ object AdmissionSimulation {
     } yield result
 
   private def toRps(rate: Rate): Double =
-    rate.requests.toDouble / rate.period.toUnit(TimeUnit.SECONDS)
+    rate.eventsPer(unit = TimeUnit.SECONDS)
 
   /** Mutable, in-flight recording for a single run: the sampled timeseries plus the counters used to derive the offered
     * / admitted / accepted throughput.
